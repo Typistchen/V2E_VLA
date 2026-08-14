@@ -2,7 +2,7 @@
 
 # DynamicVLA: A Vision-Language-Action Model for Dynamic Object Manipulation
 
-[Haozhe Xie](https://haozhexie.com), Beichen Wen, Jiarui Zheng, [Zhaoxi Chen](https://frozenburning.github.io/), [Fangzhou Hong](https://hongfz16.github.io/), [Haiwen Diao](https://paranioar.github.io/), [Ziwei Liu](https://liuziwei7.github.io/)
+[Haozhe Xie](https://haozhexie.com), [Beichen Wen](https://wenbc21.github.io/), Jiarui Zheng, [Zhaoxi Chen](https://frozenburning.github.io/), [Fangzhou Hong](https://hongfz16.github.io/), [Haiwen Diao](https://paranioar.github.io/), [Ziwei Liu](https://liuziwei7.github.io/)
 
 S-Lab, Nanyang Technological University
 
