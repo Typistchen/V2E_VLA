@@ -230,7 +230,9 @@ def dilate_mv(mv, radius=1):
 
 def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
                    depthA=None, depthB=None, hw=1.0, beta=12.0,
-                   fill_holes=True, covis_z=False, hole_fill=None, mv_dilate=0):
+                   fill_holes=True, covis_z=False, hole_fill=None, mv_dilate=0,
+                   return_validity=False, depth_abs_tol=0.05, depth_rel_tol=0.05,
+                   flow_abs_tol=1.0, flow_rel_tol=0.25, valid_margin=1):
     """Single-mv-per-gap bidirectional warp (the 125/250Hz-mv case).
 
     One real mv field per keyframe gap (the WHOLE-gap displacement, convention
@@ -255,6 +257,14 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     pixel keeps whichever of A/B has the NEARER warped surface. If False the
     co-visible region stays B-primary.
 
+    ``composite="log_blend"`` is the event-camera path. In regions where both
+    keyframes agree in depth and motion, it interpolates log luminance linearly
+    in time. This prevents a future keyframe's HDR lighting from appearing in
+    the first synthetic frame as a step change. Occlusions, holes, and pixels
+    whose warped depth/flow disagree are marked invalid. With
+    ``return_validity=True`` the function returns ``(frames, valid_masks)``;
+    consumers should suppress signal events in invalid regions.
+
     A,B  : (H,W,C) OR batched (N,H,W,C) float on GPU.  mvA,mvB : (..,H,W,2).
     depthA,depthB : (..,H,W) per-pixel depth of keyframe A / B (metres).
     ``mv_dilate`` (px): grow each mv field over its anti-aliased edge fringe
@@ -262,8 +272,10 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     Every env, both splat directions and all K-1 intermediate frames run as ONE
     batch (M = N*(K-1) per direction). Returns the K-1 intermediates at fractions
     ``1/K..(K-1)/K``, each (H,W,C) for single input or (N,H,W,C) for batched."""
-    if composite != "b_primary":
-        raise ValueError(f"unknown composite {composite!r}; only 'b_primary' is supported")
+    if composite not in ("b_primary", "log_blend"):
+        raise ValueError(
+            f"unknown composite {composite!r}; expected 'b_primary' or 'log_blend'"
+        )
     single = A.dim() == 3
     if single:
         A, B, mvA, mvB = A[None], B[None], mvA[None], mvB[None]
@@ -272,7 +284,7 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     if mv_dilate:
         mvA, mvB = dilate_mv(mvA, mv_dilate), dilate_mv(mvB, mv_dilate)
     if K == 1:
-        return []
+        return ([], []) if return_validity else []
     N, H, W, C = A.shape
     dev = A.device
     Kn = K - 1
@@ -285,9 +297,14 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
         zB = depthB if depthB.dim() == 3 else depthB[..., 0]
         impA0 = 1.0 / (zA + 1e-3)                  # near -> large importance -> wins collision
         impB0 = 1.0 / (zB + 1e-3)
-        if z_covis:                               # carry depth as a channel so it warps too
-            Ai = torch.cat([Ai, zA.unsqueeze(1)], dim=1)
-            Bi = torch.cat([Bi, zB.unsqueeze(1)], dim=1)
+        # Carry depth through the same splat as colour. Besides resolving
+        # collisions, it lets log_blend reject cross-surface correspondences.
+        Ai = torch.cat([Ai, zA.unsqueeze(1)], dim=1)
+        Bi = torch.cat([Bi, zB.unsqueeze(1)], dim=1)
+    # Warped motion must agree at a common intermediate pixel. This detects
+    # mismatched foreground/background splats even when their depths are close.
+    Ai = torch.cat([Ai, mvA.permute(0, 3, 1, 2)], dim=1)
+    Bi = torch.cat([Bi, mvB.permute(0, 3, 1, 2)], dim=1)
     Cc = Ai.shape[1]
     fs = torch.arange(1, K, device=dev, dtype=A.dtype) / K      # (Kn,) fractions
     dA = (-fs).view(1, Kn, 1, 1, 1) * mvA.unsqueeze(1)         # (N,Kn,H,W,2)
@@ -305,16 +322,69 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
         impB = torch.sqrt(dBx ** 2 + dBy ** 2)
     wA_, hA = _splat_batch(Arep, dAx, dAy, impA, hw=hw, beta=beta)   # (M,Cc,H,W),(M,H,W)
     wB_, hB = _splat_batch(Brep, dBx, dBy, impB, hw=hw, beta=beta)
-    if z_covis:
-        wA, wzA = wA_[:, :C], wA_[:, C]           # warped colour + warped depth
-        wB, wzB = wB_[:, :C], wB_[:, C]
+    wA, wB = wA_[:, :C], wB_[:, :C]
+    aux = C
+    if use_z:
+        wzA, wzB = wA_[:, aux], wB_[:, aux]
+        aux += 1
     else:
-        wA, wB = wA_, wB_
-    only_a = ((~hA) & hB).unsqueeze(1)            # (M,1,H,W)
-    neither = (hA & hB).unsqueeze(1)
-    m = wB.clone()                                # default: co-visible + B-only -> B (primary)
+        wzA = wzB = None
+    wmvA, wmvB = wA_[:, aux:aux + 2], wB_[:, aux:aux + 2]
+
+    has_a, has_b = ~hA, ~hB
+    both = has_a & has_b
+    only_a = (has_a & ~has_b).unsqueeze(1)
+    neither = (~has_a & ~has_b).unsqueeze(1)
+
+    flow_error = torch.linalg.vector_norm(wmvA - wmvB, dim=1)
+    flow_scale = torch.maximum(
+        torch.linalg.vector_norm(wmvA, dim=1),
+        torch.linalg.vector_norm(wmvB, dim=1),
+    )
+    flow_ok = flow_error <= (flow_abs_tol + flow_rel_tol * flow_scale)
+    if use_z:
+        depth_scale = torch.minimum(wzA.abs(), wzB.abs())
+        depth_ok = (wzA - wzB).abs() <= (depth_abs_tol + depth_rel_tol * depth_scale)
+    else:
+        depth_ok = torch.ones_like(flow_ok)
+    valid = both & flow_ok & depth_ok
+
+    if valid_margin > 0:
+        # One questionable boundary pixel can splat a bright/dark fringe into
+        # its neighbours. Erode validity by a small margin around disagreement.
+        invalid = F.max_pool2d(
+            (~valid).float().unsqueeze(1),
+            kernel_size=2 * valid_margin + 1,
+            stride=1,
+            padding=valid_margin,
+        ).squeeze(1) > 0
+        valid = ~invalid
+
+    alpha = fs.repeat(N).view(M, 1, 1, 1)
+    if composite == "log_blend":
+        # Blend chromaticity linearly, but force luminance to follow a geometric
+        # (log-linear) path. The event model therefore sees a constant contrast
+        # rate rather than an HDR step at the first intermediate frame.
+        eps = 1e-5
+        wA_pos, wB_pos = wA.clamp_min(0.0), wB.clamp_min(0.0)
+        lumA = 0.2126 * wA_pos[:, 0] + 0.7152 * wA_pos[:, 1] + 0.0722 * wA_pos[:, 2]
+        lumB = 0.2126 * wB_pos[:, 0] + 0.7152 * wB_pos[:, 1] + 0.0722 * wB_pos[:, 2]
+        target_lum = torch.exp(
+            (1.0 - alpha[:, 0]) * torch.log(lumA + eps)
+            + alpha[:, 0] * torch.log(lumB + eps)
+        ) - eps
+        blended = (1.0 - alpha) * wA_pos + alpha * wB_pos
+        blended_lum = (
+            0.2126 * blended[:, 0] + 0.7152 * blended[:, 1] + 0.0722 * blended[:, 2]
+        )
+        blended = blended * (target_lum / (blended_lum + eps)).unsqueeze(1)
+        m = torch.where(valid.unsqueeze(1), blended, wB)
+    else:
+        m = wB.clone()                            # legacy B-primary behaviour
+
     if z_covis:
-        m = torch.where(((~hA) & (~hB) & (wzA < wzB)).unsqueeze(1), wA, m)   # nearer real surface
+        nearer_a = both & (wzA < wzB)
+        m = torch.where((nearer_a & ~valid).unsqueeze(1), wA, m)
     if fill_holes:
         m = torch.where(only_a, wA, m)            # B's disocclusion hole -> fill from A
     # double-occlusion: black by default (unknown, no fabrication); or a constant
@@ -322,10 +392,13 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     fill = torch.zeros_like(m) if hole_fill is None else torch.full_like(m, float(hole_fill))
     m = torch.where(neither, fill, m)
     m = m.reshape(N, Kn, C, H, W).permute(0, 1, 3, 4, 2)        # (N,Kn,H,W,C)
+    valid = valid.reshape(N, Kn, H, W)
     outs = [m[:, i] for i in range(Kn)]
+    valid_outs = [valid[:, i] for i in range(Kn)]
     if single:
         outs = [o[0] for o in outs]
-    return outs
+        valid_outs = [v[0] for v in valid_outs]
+    return (outs, valid_outs) if return_validity else outs
 
 
 def _sample_field(field, pos):

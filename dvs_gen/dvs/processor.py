@@ -27,6 +27,7 @@ class BatchedMultiCamProcessor:
         self.ref_log_intensity = None
         self.prev_log_intensity = None
         self.prev_time = None
+        self.prev_valid_mask = None
         self.needs_reset_mask = None # Tracks which envs need a new reference frame
         # opt-in: keep this call's (pos_mask, neg_mask) so a caller can render the
         # per-frame event image aligned to the warped RGB frame. Off = zero overhead.
@@ -40,7 +41,8 @@ class BatchedMultiCamProcessor:
             if self.noise is not None:
                 self.noise.reset_envs(env_ids)         # re-seed the bandwidth filter state
 
-    def __call__(self, rgb_batch: torch.Tensor, current_time: float):
+    def __call__(self, rgb_batch: torch.Tensor, current_time: float,
+                 valid_mask: torch.Tensor | None = None):
         # rgb_batch: (num_envs, H, W, C)
         num_envs = rgb_batch.shape[0]
         device = rgb_batch.device
@@ -52,18 +54,38 @@ class BatchedMultiCamProcessor:
 
         intensity = (0.2126 * rgb_batch[..., 0] + 0.7152 * rgb_batch[..., 1] + 0.0722 * rgb_batch[..., 2])
         log_intensity = torch.log(intensity + 1e-5)
+        if valid_mask is None:
+            valid_mask = torch.ones_like(log_intensity, dtype=torch.bool)
+        else:
+            if valid_mask.dim() == log_intensity.dim() + 1 and valid_mask.shape[-1] == 1:
+                valid_mask = valid_mask[..., 0]
+            if valid_mask.shape != log_intensity.shape:
+                raise ValueError(
+                    f"valid_mask shape {tuple(valid_mask.shape)} does not match "
+                    f"intensity shape {tuple(log_intensity.shape)}"
+                )
+            valid_mask = valid_mask.to(device=device, dtype=torch.bool)
+
+        # Invalid warp pixels have no trustworthy irradiance measurement. Keep
+        # their last valid photoreceptor state rather than turning a splat hole
+        # or a cross-surface mismatch into signal events.
+        if self.prev_log_intensity is not None:
+            log_intensity = torch.where(valid_mask, log_intensity, self.prev_log_intensity)
 
         # Intensity-dependent photoreceptor bandwidth (noise model hook 0): lowpass
         # the log frame BEFORE the reference logic so the whole event model sees the
         # filtered signal. cutoff_hz == 0 (default) returns it untouched.
         if self.noise is not None:
             log_intensity = self.noise.bandwidth_filter(log_intensity, intensity, current_time)
+            if self.prev_log_intensity is not None:
+                log_intensity = torch.where(valid_mask, log_intensity, self.prev_log_intensity)
 
         # Initialization
         if self.ref_log_intensity is None:
             self.ref_log_intensity = log_intensity.clone()
             self.prev_log_intensity = log_intensity.clone()
             self.prev_time = float(current_time)
+            self.prev_valid_mask = valid_mask.clone()
             self.needs_reset_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
             return
 
@@ -76,6 +98,15 @@ class BatchedMultiCamProcessor:
             # We don't generate events for the reset frame itself
         else:
             reset_mask = None
+
+        # A pixel that becomes trustworthy again after one or more invalid warp
+        # samples is re-anchored silently. Emitting its accumulated difference at
+        # the recovery frame would create exactly the periodic event burst the
+        # validity mask is intended to prevent.
+        revalidated = valid_mask & ~self.prev_valid_mask
+        if revalidated.any():
+            self.ref_log_intensity[revalidated] = log_intensity[revalidated]
+            self.prev_log_intensity[revalidated] = log_intensity[revalidated]
 
         # 2. Compute differences. With a noise model, use PER-PIXEL thresholds
         # (fixed-pattern mismatch); otherwise the single scalar threshold.
@@ -92,6 +123,8 @@ class BatchedMultiCamProcessor:
         # them, rather than collapsing the entire change into one boolean event.
         n_pos = torch.floor(torch.clamp_min(diff, 0.0) / th_on_full).to(torch.int64)
         n_neg = torch.floor(torch.clamp_min(-diff, 0.0) / th_off_full).to(torch.int64)
+        n_pos[~valid_mask] = 0
+        n_neg[~valid_mask] = 0
         if reset_mask is not None:
             n_pos[reset_mask] = 0
             n_neg[reset_mask] = 0
@@ -115,6 +148,8 @@ class BatchedMultiCamProcessor:
             )
             empty = torch.zeros_like(n_pos, dtype=torch.bool)
             noise_pos, noise_neg = self.noise.apply(empty, empty, intensity, current_time)
+            noise_pos &= valid_mask
+            noise_neg &= valid_mask
             self._record_masks(noise_pos, noise_neg, current_time)
             pos_seen |= noise_pos
             neg_seen |= noise_neg
@@ -127,7 +162,10 @@ class BatchedMultiCamProcessor:
         if self.stash_events:               # final recorded masks (incl. noise) for the event image
             self.last_masks = (pos_seen, neg_seen)
 
-        self.prev_log_intensity = log_intensity.clone()
+        self.prev_log_intensity = torch.where(
+            valid_mask, log_intensity, self.prev_log_intensity
+        )
+        self.prev_valid_mask = valid_mask.clone()
         self.prev_time = float(current_time)
 
     def _crossing_time(self, target, current, previous, current_time):
