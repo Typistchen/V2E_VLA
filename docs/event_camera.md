@@ -28,8 +28,10 @@ OMNI_KIT_ACCEPT_EULA=YES \
 
 Event files are written under `<output_dir>/events/env<id>_ep<seed>.h5`. Each
 contains `DVS/wrist_cam`, `DVS/opst_cam`, and `DVS/side_cam`, with `x`, `y`, `t`,
-`p`, and `q` datasets. `q` is the per-event soft warp confidence in `[0,1]`;
-DynamicVLA can use it as a voxel weight without deleting uncertain cup/robot
-edges. Set `--no-event_adaptive_warp` for the fixed-K v2 comparison,
+`p`, and `q` datasets. `q` is the per-event soft warp confidence: `0` is
+unobservable, visible synthesized events are in `[0.5,1]`, and real samples
+default to `1`. DynamicVLA can use it as a voxel weight or auxiliary channel;
+do not hard-threshold it, because uncertain cup/robot edges are task-relevant.
+Set `--no-event_adaptive_warp` for the fixed-K v2 comparison,
 `--event_warp 1` to disable interpolation, or `--event_source ldr` to generate
 events from tone-mapped RGB instead of HDR.
