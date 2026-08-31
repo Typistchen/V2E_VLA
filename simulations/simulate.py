@@ -910,8 +910,10 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
             env.unwrapped.scene,
             camera_names,
             out_dir=sim_cfg["event_output_dir"],
+            enable_warp=sim_cfg["event_warp"] > 1,
         )
-        dvs_prev = dvs.snapshot()
+        if sim_cfg["event_warp"] > 1:
+            dvs_prev = dvs.snapshot()
         dvs_t_prev = float(env.unwrapped.sim.current_time)
 
     # Determine the object size (without transformation)
@@ -1008,10 +1010,10 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
         )
         env.step(next_state["action"])
         if dvs is not None:
-            dvs_cur = dvs.snapshot()
             event_warp = sim_cfg["event_warp"]
             dvs_t_cur = float(env.unwrapped.sim.current_time)
             if event_warp > 1:
+                dvs_cur = dvs.snapshot()
                 dvs.warp_and_process(
                     dvs_prev,
                     dvs_cur,
@@ -1019,9 +1021,9 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
                     dvs_t_prev,
                     max(0.0, dvs_t_cur - dvs_t_prev) / event_warp,
                 )
+                dvs_prev = dvs_cur
             else:
                 dvs.process(dvs_t_cur)
-            dvs_prev = dvs_cur
             dvs_t_prev = dvs_t_cur
         env_states.append(
             {
