@@ -347,13 +347,24 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
         depth_ok = (wzA - wzB).abs() <= (depth_abs_tol + depth_rel_tol * depth_scale)
     else:
         depth_ok = torch.ones_like(flow_ok)
-    valid = both & flow_ok & depth_ok
+    # Agreement is useful for deciding whether A/B describe the same surface,
+    # but it must not be a hard event-validity gate. Accelerating/rotating task
+    # objects naturally have different endpoint flow and were otherwise erased
+    # from the event stream. When depth exists it is the stronger surface cue;
+    # flow is the fallback only for RGB-only callers.
+    same_surface = both & (depth_ok if use_z else flow_ok)
+
+    # Only a true bidirectional coverage hole is unobservable. One-sided
+    # disocclusions and inconsistent dynamic surfaces still carry real image
+    # content and must remain capable of producing events.
+    valid = has_a | has_b
 
     if valid_margin > 0:
-        # One questionable boundary pixel can splat a bright/dark fringe into
-        # its neighbours. Erode validity by a small margin around disagreement.
+        # A double-hole fill can splat a bright/dark fringe into its neighbours.
+        # Erode only around those genuinely unobserved pixels, not around every
+        # depth/flow disagreement on a moving object.
         invalid = F.max_pool2d(
-            (~valid).float().unsqueeze(1),
+            neither.float(),
             kernel_size=2 * valid_margin + 1,
             stride=1,
             padding=valid_margin,
@@ -378,13 +389,13 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
             0.2126 * blended[:, 0] + 0.7152 * blended[:, 1] + 0.0722 * blended[:, 2]
         )
         blended = blended * (target_lum / (blended_lum + eps)).unsqueeze(1)
-        m = torch.where(valid.unsqueeze(1), blended, wB)
+        m = torch.where(same_surface.unsqueeze(1), blended, wB)
     else:
         m = wB.clone()                            # legacy B-primary behaviour
 
     if z_covis:
-        nearer_a = both & (wzA < wzB)
-        m = torch.where((nearer_a & ~valid).unsqueeze(1), wA, m)
+        nearer_a = both & ~same_surface & (wzA < wzB)
+        m = torch.where(nearer_a.unsqueeze(1), wA, m)
     if fill_holes:
         m = torch.where(only_a, wA, m)            # B's disocclusion hole -> fill from A
     # double-occlusion: black by default (unknown, no fabrication); or a constant

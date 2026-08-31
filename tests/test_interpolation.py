@@ -35,7 +35,7 @@ def test_log_blend_is_linear_in_log_luminance():
         assert torch.allclose(frame, torch.full_like(frame, expected), atol=2e-5)
 
 
-def test_depth_disagreement_is_invalid_and_uses_nearer_surface():
+def test_depth_disagreement_keeps_coverage_and_uses_nearer_surface():
     a = constant_frame(1.0)
     b = constant_frame(4.0)
     mv = zero_motion()
@@ -54,23 +54,21 @@ def test_depth_disagreement_is_invalid_and_uses_nearer_surface():
         valid_margin=0,
     )
 
-    assert not torch.any(masks[0])
+    assert torch.all(masks[0])
     assert torch.allclose(frames[0], a[0])
 
 
-def test_motion_disagreement_marks_warp_as_invalid():
+def test_only_double_coverage_holes_are_invalid():
     a = constant_frame(1.0)
     b = constant_frame(1.0)
-    mv_a = zero_motion()
-    mv_b = torch.full_like(mv_a, 0.5)
+    mv_a = torch.full_like(zero_motion(), -100.0)
+    mv_b = torch.full_like(mv_a, 100.0)
 
     _, masks = bidir_warp_gap(
         a, b, mv_a, mv_b, 2,
         composite="log_blend",
         return_validity=True,
-        flow_abs_tol=0.1,
-        flow_rel_tol=0.0,
         valid_margin=0,
     )
 
-    assert not torch.any(masks[0][1:-1, 1:-1])
+    assert not torch.any(masks[0])
