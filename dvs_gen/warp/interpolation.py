@@ -231,7 +231,8 @@ def dilate_mv(mv, radius=1):
 def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
                    depthA=None, depthB=None, hw=1.0, beta=12.0,
                    fill_holes=True, covis_z=False, hole_fill=None, mv_dilate=0,
-                   return_validity=False, depth_abs_tol=0.05, depth_rel_tol=0.05,
+                   return_validity=False, return_confidence=False,
+                   depth_abs_tol=0.05, depth_rel_tol=0.05,
                    flow_abs_tol=1.0, flow_rel_tol=0.25, valid_margin=1):
     """Single-mv-per-gap bidirectional warp (the 125/250Hz-mv case).
 
@@ -263,7 +264,10 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     the first synthetic frame as a step change. Occlusions, holes, and pixels
     whose warped depth/flow disagree are marked invalid. With
     ``return_validity=True`` the function returns ``(frames, valid_masks)``;
-    consumers should suppress signal events in invalid regions.
+    consumers should suppress signal events in invalid regions. Setting
+    ``return_confidence=True`` additionally returns a soft per-pixel warp
+    confidence in ``[0,1]``. It is intentionally metadata, not a hard gate:
+    moving objects with imperfect endpoint agreement remain in the event stream.
 
     A,B  : (H,W,C) OR batched (N,H,W,C) float on GPU.  mvA,mvB : (..,H,W,2).
     depthA,depthB : (..,H,W) per-pixel depth of keyframe A / B (metres).
@@ -284,6 +288,8 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     if mv_dilate:
         mvA, mvB = dilate_mv(mvA, mv_dilate), dilate_mv(mvB, mv_dilate)
     if K == 1:
+        if return_confidence:
+            return [], [], []
         return ([], []) if return_validity else []
     N, H, W, C = A.shape
     dev = A.device
@@ -344,8 +350,12 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     flow_ok = flow_error <= (flow_abs_tol + flow_rel_tol * flow_scale)
     if use_z:
         depth_scale = torch.minimum(wzA.abs(), wzB.abs())
-        depth_ok = (wzA - wzB).abs() <= (depth_abs_tol + depth_rel_tol * depth_scale)
+        depth_error = (wzA - wzB).abs()
+        depth_tol = depth_abs_tol + depth_rel_tol * depth_scale
+        depth_ok = depth_error <= depth_tol
     else:
+        depth_error = None
+        depth_tol = None
         depth_ok = torch.ones_like(flow_ok)
     # Agreement is useful for deciding whether A/B describe the same surface,
     # but it must not be a hard event-validity gate. Accelerating/rotating task
@@ -359,6 +369,25 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     # content and must remain capable of producing events.
     valid = has_a | has_b
 
+    # Soft quality is separate from hard observability. Endpoint disagreement
+    # lowers confidence continuously, while a one-sided disocclusion still gets
+    # a usable (but explicitly uncertain) score. Depth is the stronger cue when
+    # available; flow contributes more gently because acceleration and rotation
+    # naturally make endpoint motion vectors disagree on real task objects.
+    flow_tol = flow_abs_tol + flow_rel_tol * flow_scale
+    flow_conf = torch.exp(-flow_error / flow_tol.clamp_min(1e-6))
+    if use_z:
+        depth_conf = torch.exp(-depth_error / depth_tol.clamp_min(1e-6))
+        agreement_conf = torch.sqrt(depth_conf * torch.sqrt(flow_conf))
+    else:
+        agreement_conf = flow_conf
+    confidence = torch.where(
+        both,
+        agreement_conf,
+        torch.full_like(agreement_conf, 0.5),
+    )
+    confidence = torch.where(has_a | has_b, confidence, torch.zeros_like(confidence))
+
     if valid_margin > 0:
         # A double-hole fill can splat a bright/dark fringe into its neighbours.
         # Erode only around those genuinely unobserved pixels, not around every
@@ -370,6 +399,7 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
             padding=valid_margin,
         ).squeeze(1) > 0
         valid = ~invalid
+        confidence = torch.where(valid, confidence, torch.zeros_like(confidence))
 
     alpha = fs.repeat(N).view(M, 1, 1, 1)
     if composite == "log_blend":
@@ -404,11 +434,16 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
     m = torch.where(neither, fill, m)
     m = m.reshape(N, Kn, C, H, W).permute(0, 1, 3, 4, 2)        # (N,Kn,H,W,C)
     valid = valid.reshape(N, Kn, H, W)
+    confidence = confidence.reshape(N, Kn, H, W).clamp_(0.0, 1.0)
     outs = [m[:, i] for i in range(Kn)]
     valid_outs = [valid[:, i] for i in range(Kn)]
+    confidence_outs = [confidence[:, i] for i in range(Kn)]
     if single:
         outs = [o[0] for o in outs]
         valid_outs = [v[0] for v in valid_outs]
+        confidence_outs = [q[0] for q in confidence_outs]
+    if return_confidence:
+        return outs, valid_outs, confidence_outs
     return (outs, valid_outs) if return_validity else outs
 
 

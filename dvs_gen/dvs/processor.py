@@ -28,6 +28,7 @@ class BatchedMultiCamProcessor:
         self.prev_log_intensity = None
         self.prev_time = None
         self.prev_valid_mask = None
+        self.prev_confidence = None
         self.needs_reset_mask = None # Tracks which envs need a new reference frame
         # opt-in: keep this call's (pos_mask, neg_mask) so a caller can render the
         # per-frame event image aligned to the warped RGB frame. Off = zero overhead.
@@ -42,7 +43,8 @@ class BatchedMultiCamProcessor:
                 self.noise.reset_envs(env_ids)         # re-seed the bandwidth filter state
 
     def __call__(self, rgb_batch: torch.Tensor, current_time: float,
-                 valid_mask: torch.Tensor | None = None):
+                 valid_mask: torch.Tensor | None = None,
+                 confidence: torch.Tensor | None = None):
         # rgb_batch: (num_envs, H, W, C)
         num_envs = rgb_batch.shape[0]
         device = rgb_batch.device
@@ -65,6 +67,19 @@ class BatchedMultiCamProcessor:
                     f"intensity shape {tuple(log_intensity.shape)}"
                 )
             valid_mask = valid_mask.to(device=device, dtype=torch.bool)
+        if confidence is None:
+            confidence = torch.ones_like(log_intensity)
+        else:
+            if confidence.dim() == log_intensity.dim() + 1 and confidence.shape[-1] == 1:
+                confidence = confidence[..., 0]
+            if confidence.shape != log_intensity.shape:
+                raise ValueError(
+                    f"confidence shape {tuple(confidence.shape)} does not match "
+                    f"intensity shape {tuple(log_intensity.shape)}"
+                )
+            confidence = confidence.to(device=device, dtype=log_intensity.dtype)
+            confidence = confidence.clamp(0.0, 1.0)
+        confidence = torch.where(valid_mask, confidence, torch.zeros_like(confidence))
 
         # Invalid warp pixels have no trustworthy irradiance measurement. Keep
         # their last valid photoreceptor state rather than turning a splat hole
@@ -86,6 +101,7 @@ class BatchedMultiCamProcessor:
             self.prev_log_intensity = log_intensity.clone()
             self.prev_time = float(current_time)
             self.prev_valid_mask = valid_mask.clone()
+            self.prev_confidence = confidence.clone()
             self.needs_reset_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
             return
 
@@ -93,6 +109,7 @@ class BatchedMultiCamProcessor:
         if self.needs_reset_mask.any():
             self.ref_log_intensity[self.needs_reset_mask] = log_intensity[self.needs_reset_mask]
             self.prev_log_intensity[self.needs_reset_mask] = log_intensity[self.needs_reset_mask]
+            self.prev_confidence[self.needs_reset_mask] = confidence[self.needs_reset_mask]
             reset_mask = self.needs_reset_mask.clone()
             self.needs_reset_mask.fill_(False)
             # We don't generate events for the reset frame itself
@@ -107,6 +124,12 @@ class BatchedMultiCamProcessor:
         if revalidated.any():
             self.ref_log_intensity[revalidated] = log_intensity[revalidated]
             self.prev_log_intensity[revalidated] = log_intensity[revalidated]
+            self.prev_confidence[revalidated] = confidence[revalidated]
+
+        # An event spans the interval between two irradiance samples, so its
+        # quality cannot exceed the weaker endpoint. This score is metadata only:
+        # unlike ``valid_mask`` it never suppresses a real event.
+        event_confidence = torch.minimum(self.prev_confidence, confidence)
 
         # 2. Compute differences. With a noise model, use PER-PIXEL thresholds
         # (fixed-pattern mismatch); otherwise the single scalar threshold.
@@ -144,19 +167,19 @@ class BatchedMultiCamProcessor:
         if self.noise is not None:
             pos_seen, neg_seen = self._record_crossing_layers(
                 n_pos, n_neg, th_on_full, th_off_full, ref_before,
-                log_intensity, current_time,
+                log_intensity, current_time, event_confidence,
             )
             empty = torch.zeros_like(n_pos, dtype=torch.bool)
             noise_pos, noise_neg = self.noise.apply(empty, empty, intensity, current_time)
             noise_pos &= valid_mask
             noise_neg &= valid_mask
-            self._record_masks(noise_pos, noise_neg, current_time)
+            self._record_masks(noise_pos, noise_neg, current_time, event_confidence)
             pos_seen |= noise_pos
             neg_seen |= noise_neg
         else:
             pos_seen, neg_seen = self._record_expanded_crossings(
                 n_pos, n_neg, th_on_full, th_off_full, ref_before,
-                log_intensity, current_time,
+                log_intensity, current_time, event_confidence,
             )
 
         if self.stash_events:               # final recorded masks (incl. noise) for the event image
@@ -166,6 +189,7 @@ class BatchedMultiCamProcessor:
             valid_mask, log_intensity, self.prev_log_intensity
         )
         self.prev_valid_mask = valid_mask.clone()
+        self.prev_confidence = confidence.clone()
         self.prev_time = float(current_time)
 
     def _crossing_time(self, target, current, previous, current_time):
@@ -223,7 +247,7 @@ class BatchedMultiCamProcessor:
         return envs, ys, xs, times
 
     def _record_expanded_crossings(self, n_pos, n_neg, th_on, th_off,
-                                   ref_before, current, current_time):
+                                   ref_before, current, current_time, confidence):
         ep, yp, xp, tp = self._expanded_polarity(
             n_pos, th_on, ref_before, current, current_time, 1
         )
@@ -240,13 +264,15 @@ class BatchedMultiCamProcessor:
         ])
         if times.numel() > 0:
             order = torch.argsort(times)
+            quality = confidence[envs, ys, xs]
             self.recorder.record(
-                self.camera_name, envs[order], xs[order], ys[order], ps[order], times[order]
+                self.camera_name, envs[order], xs[order], ys[order], ps[order],
+                times[order], confidence=quality[order],
             )
         return n_pos > 0, n_neg > 0
 
     def _record_crossing_layers(self, n_pos, n_neg, th_on, th_off,
-                                ref_before, current, current_time):
+                                ref_before, current, current_time, confidence):
         pos_seen = torch.zeros_like(n_pos, dtype=torch.bool)
         neg_seen = torch.zeros_like(n_neg, dtype=torch.bool)
         batches = []
@@ -276,8 +302,10 @@ class BatchedMultiCamProcessor:
                 torch.cat([batch[i] for batch in batches]) for i in range(5)
             )
             order = torch.argsort(times)
+            quality = confidence[envs, ys, xs]
             self.recorder.record(
-                self.camera_name, envs[order], xs[order], ys[order], ps[order], times[order]
+                self.camera_name, envs[order], xs[order], ys[order], ps[order],
+                times[order], confidence=quality[order],
             )
         return pos_seen, neg_seen
 
@@ -305,12 +333,13 @@ class BatchedMultiCamProcessor:
             )
         return all_envs, all_xs, all_ys, all_ps, all_t
 
-    def _record_masks(self, pos_mask, neg_mask, event_time):
+    def _record_masks(self, pos_mask, neg_mask, event_time, confidence):
         batch = self._events_from_masks(pos_mask, neg_mask, event_time)
         if batch is not None:
             all_envs, all_xs, all_ys, all_ps, all_t = batch
             order = torch.argsort(all_t)
+            quality = confidence[all_envs, all_ys, all_xs]
             self.recorder.record(
                 self.camera_name, all_envs[order], all_xs[order], all_ys[order],
-                all_ps[order], all_t[order],
+                all_ps[order], all_t[order], confidence=quality[order],
             )

@@ -219,6 +219,7 @@ class DVSCamera:
         self.blur_cfgs = dict(blur_cfgs or {})
         self._blur_accs = {}
         self._blur_valid_masks = {}
+        self._blur_confidence_maps = {}
         # warp double-occlusion hole fill: None = black; a float = that constant;
         # "bg" = the frame's brightest value (auto white for a uniform bright backdrop).
         self.hole_fill = hole_fill
@@ -418,11 +419,11 @@ class DVSCamera:
         hf = self.hole_fill
         if hf == "bg":                             # auto: brightest value = uniform bright backdrop
             hf = float(max(A.max(), B.max()))
-        mids, valid_mids = bidir_warp_gap(
+        mids, valid_mids, confidence_mids = bidir_warp_gap(
             A, B, mvA, mvB, K, self.composite,
             depthA=dA, depthB=dB, hole_fill=hf,
             mv_dilate=self.mv_dilate, covis_z=True,
-            return_validity=True,
+            return_confidence=True,
         )
         for i in range(K - 1):
             t = t0 + (i + 1) * dt_fine
@@ -432,13 +433,17 @@ class DVSCamera:
                 valid = self._crop(
                     valid_mids[i][ci * Nenv:(ci + 1) * Nenv, ..., None]
                 )[..., 0]
-                self._feed(name, proc, f, t, dt_fine, blur_cb, valid)
+                confidence = self._crop(
+                    confidence_mids[i][ci * Nenv:(ci + 1) * Nenv, ..., None]
+                )[..., 0]
+                self._feed(name, proc, f, t, dt_fine, blur_cb, valid, confidence)
                 frame_dict[name] = f
             if frame_cb is not None:
                 frame_cb(i + 1, frame_dict)
         return K
 
-    def _feed(self, name, proc, f, t, dt_fine, blur_cb, valid_mask=None):
+    def _feed(self, name, proc, f, t, dt_fine, blur_cb, valid_mask=None,
+              confidence=None):
         """Route one fine frame ``f`` (N,H,W,C) at time ``t`` for camera ``name``.
 
         No motion blur          -> the event model sees the sharp frame (as always).
@@ -449,19 +454,19 @@ class DVSCamera:
                                    RGB output via ``blur_cb``.
         ``blur_cb({name: env0_frame})`` fires whenever a window fills, either way.
         """
-        def feed_processor(frame, timestamp, validity):
-            if validity is None:
+        def feed_processor(frame, timestamp, validity, quality):
+            if validity is None and quality is None:
                 proc(frame, timestamp)
             else:
-                proc(frame, timestamp, validity)
+                proc(frame, timestamp, valid_mask=validity, confidence=quality)
 
         bc = self.blur_cfgs.get(name)
         if bc is None:
-            feed_processor(f, t, valid_mask)
+            feed_processor(f, t, valid_mask, confidence)
             return
         feed_ev = getattr(bc, "feed_events", False)
         if not feed_ev:
-            feed_processor(f, t, valid_mask)
+            feed_processor(f, t, valid_mask, confidence)
         acc = self._blur_accs.get(name)
         if acc is None:                              # lazy: window needs dt_fine
             win = max(1, int(round((bc.exposure_ms / 1000.0) / dt_fine)))
@@ -472,11 +477,18 @@ class DVSCamera:
             self._blur_valid_masks[name] = (
                 valid_mask.clone() if pending is None else pending & valid_mask
             )
+        if confidence is not None:
+            pending_q = self._blur_confidence_maps.get(name)
+            self._blur_confidence_maps[name] = (
+                confidence.clone() if pending_q is None
+                else torch.minimum(pending_q, confidence)
+            )
         avg = acc.add(f)                             # full batch (N,H,W,C)
         if avg is not None:
             avg_valid = self._blur_valid_masks.pop(name, None)
+            avg_confidence = self._blur_confidence_maps.pop(name, None)
             if feed_ev:
-                feed_processor(avg, t, avg_valid)    # events from the blurred frame
+                feed_processor(avg, t, avg_valid, avg_confidence)
             if blur_cb is not None:
                 blur_cb({name: avg[0]})              # env-0 for the video output
 
@@ -491,6 +503,7 @@ class DVSCamera:
                 out[name] = b[0] if b.dim() == 4 else b
         self._blur_accs = {}
         self._blur_valid_masks = {}
+        self._blur_confidence_maps = {}
         if out and blur_cb is not None:
             blur_cb(out)
 

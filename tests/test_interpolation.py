@@ -72,3 +72,43 @@ def test_only_double_coverage_holes_are_invalid():
     )
 
     assert not torch.any(masks[0])
+
+
+def test_confidence_is_soft_metadata_not_a_dynamic_object_gate():
+    a = constant_frame(1.0)
+    b = constant_frame(4.0)
+    mv = zero_motion()
+    depth_a = torch.ones((1, 4, 5), dtype=torch.float32)
+    depth_b = torch.full_like(depth_a, 3.0)
+
+    frames, masks, confidence = bidir_warp_gap(
+        a, b, mv, mv, 2,
+        composite="log_blend",
+        depthA=depth_a,
+        depthB=depth_b,
+        covis_z=True,
+        return_confidence=True,
+        depth_abs_tol=0.01,
+        depth_rel_tol=0.0,
+        valid_margin=0,
+    )
+
+    assert torch.all(masks[0])
+    assert torch.all(confidence[0] < 0.1)
+    assert torch.allclose(frames[0], a[0])
+
+
+def test_double_hole_has_zero_confidence():
+    a = constant_frame(1.0)
+    b = constant_frame(1.0)
+    mv_a = torch.full_like(zero_motion(), -100.0)
+    mv_b = torch.full_like(mv_a, 100.0)
+
+    _, masks, confidence = bidir_warp_gap(
+        a, b, mv_a, mv_b, 2,
+        return_confidence=True,
+        valid_margin=0,
+    )
+
+    assert not torch.any(masks[0])
+    assert torch.count_nonzero(confidence[0]) == 0
