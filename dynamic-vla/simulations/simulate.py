@@ -1440,8 +1440,8 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Adapt temporal warp knots to motion/HDR change. Use "
-            "--no-event_adaptive_warp for the fixed-K v2 ablation."
+            "Opt into experimental v3 temporal knots adapted to motion/HDR "
+            "change (default: fixed-K balanced v2)."
         ),
     )
     parser.add_argument(
