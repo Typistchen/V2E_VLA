@@ -37,7 +37,8 @@ The experimental `feat/continuous-events-v3` history is also imported. It adds
 adaptive `K=4..8` temporal sampling and an HDF5 `q` confidence dataset while
 keeping all visible dynamic-object events. The seed-2 cup remains intact, but
 v3 is not promoted over balanced v2 yet because its raw 10 ms phase-imbalance
-metric is slightly worse on this episode. Use `--no-event_adaptive_warp` for the
-fixed-K v2 ablation; do not hard-threshold `q` in a VLA loader.
+metric is slightly worse on this episode. Fixed-K balanced v2 therefore remains
+the default; pass `--event_adaptive_warp` to opt into v3. Do not hard-threshold
+`q` in a VLA loader.
 
 See `dynamic-vla/docs/event_camera.md` for setup and generation commands.
