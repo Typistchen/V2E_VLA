@@ -13,11 +13,15 @@ class MemoryRecorder:
     def __init__(self):
         self.batches = []
 
-    def record(self, camera_name, env_ids, xs, ys, ps, t):
+    def record(self, camera_name, env_ids, xs, ys, ps, t, confidence=None):
         if torch.is_tensor(t):
             times = t.detach().cpu().clone()
         else:
             times = torch.full((xs.numel(),), float(t), dtype=torch.float64)
+        quality = (
+            torch.ones(xs.numel(), dtype=torch.float32)
+            if confidence is None else confidence.detach().cpu().float().clone()
+        )
         self.batches.append(
             {
                 "camera": camera_name,
@@ -26,6 +30,7 @@ class MemoryRecorder:
                 "y": ys.detach().cpu().clone(),
                 "p": ps.detach().cpu().clone(),
                 "t": times,
+                "q": quality,
             }
         )
 
@@ -37,7 +42,7 @@ class MemoryRecorder:
             }
         return {
             key: torch.cat([batch[key] for batch in self.batches])
-            for key in ("env", "x", "y", "p", "t")
+            for key in ("env", "x", "y", "p", "t", "q")
         }
 
 
@@ -176,3 +181,16 @@ def test_recorder_writes_per_event_timestamps(tmp_path):
 
     with h5py.File(tmp_path / "env0_ep7.h5", "r") as stream:
         np.testing.assert_allclose(stream["DVS/cam/t"][:], [0.1, 0.2, 0.3])
+        np.testing.assert_allclose(stream["DVS/cam/q"][:], [1.0, 1.0, 1.0])
+
+
+def test_soft_confidence_is_attached_without_suppressing_events():
+    recorder = MemoryRecorder()
+    processor = BatchedMultiCamProcessor(recorder, "cam", threshold=0.15)
+
+    processor(rgb_from_log(0.0), 0.0, confidence=torch.tensor([[[0.8]]]))
+    processor(rgb_from_log(0.46), 1.0, confidence=torch.tensor([[[0.3]]]))
+
+    events = recorder.events()
+    assert events["p"].tolist() == [1, 1, 1]
+    assert torch.allclose(events["q"], torch.full((3,), 0.3))

@@ -13,6 +13,7 @@ HDF5 layout (one file ``env{env_id}_ep{episode_idx}.h5`` per environment)::
     /<camera_name>/y   uint16   (gzip)  pixel y
     /<camera_name>/t   float64  (gzip)  timestamp (seconds)
     /<camera_name>/p   int8     (gzip)  polarity  (+1 = ON, -1 = OFF)
+    /<camera_name>/q   float16  (gzip)  warp confidence (0=hole, visible>=0.5)
 """
 import os
 import threading
@@ -39,7 +40,7 @@ class GeneralDVSRecorder:
         self._events = defaultdict(lambda: defaultdict(list))
 
     def record(self, camera_name: str, env_ids: torch.Tensor, xs: torch.Tensor,
-               ys: torch.Tensor, ps: torch.Tensor, t):
+               ys: torch.Tensor, ps: torch.Tensor, t, confidence=None):
         """Buffer an event batch.
 
         ``t`` may be one scalar timestamp (legacy callers) or one timestamp per
@@ -66,16 +67,31 @@ class GeneralDVSRecorder:
                 raise ValueError(
                     f"Expected one timestamp per event ({x_np.shape}), got {t_np.shape}."
                 )
+        if confidence is None:
+            q_np = np.ones(x_np.shape, dtype=np.float16)
+        elif torch.is_tensor(confidence):
+            q_np = confidence.detach().cpu().numpy().astype(np.float16).reshape(-1)
+        else:
+            q_np = np.asarray(confidence, dtype=np.float16)
+            if q_np.ndim == 0:
+                q_np = np.full(x_np.shape, float(q_np), dtype=np.float16)
+            else:
+                q_np = q_np.reshape(-1)
+        if q_np.shape != x_np.shape:
+            raise ValueError(
+                f"Expected one confidence per event ({x_np.shape}), got {q_np.shape}."
+            )
+        q_np = np.clip(q_np, 0.0, 1.0).astype(np.float16, copy=False)
 
         with self._lock:
             if e_np.size and e_np.min() == e_np.max():     # fast path: all events in one env (num_envs=1)
                 self._events[int(e_np[0])][camera_name].append(
-                    (x_np, y_np, t_np, p_np))
+                    (x_np, y_np, t_np, p_np, q_np))
             else:
                 for e in np.unique(e_np):                   # group by env, still array-wise (no per-event loop)
                     m = e_np == e
                     self._events[int(e)][camera_name].append(
-                        (x_np[m], y_np[m], t_np[m], p_np[m]))
+                        (x_np[m], y_np[m], t_np[m], p_np[m], q_np[m]))
 
     def flush_episode(self, env_id: int, episode_idx: int):
         """Flushes all cameras for a single environment to a single HDF5 file."""
@@ -96,11 +112,12 @@ class GeneralDVSRecorder:
                 # Create a group for each camera in this environment
                 grp = f.create_group(cam_name)
 
-                # Each chunk is (x_arr, y_arr, t_arr, p_arr) — concatenate them all
+                # Each chunk is (x_arr, y_arr, t_arr, p_arr, q_arr).
                 xs = np.concatenate([c[0] for c in chunks]).astype(np.uint16)
                 ys = np.concatenate([c[1] for c in chunks]).astype(np.uint16)
                 ts = np.concatenate([c[2] for c in chunks]).astype(np.float64)
                 ps = np.concatenate([c[3] for c in chunks]).astype(np.int8)
+                qs = np.concatenate([c[4] for c in chunks]).astype(np.float16)
                 counts[cam_name] = int(xs.shape[0])
 
                 # Write each dataset in blocks rather than one monolithic
@@ -111,6 +128,7 @@ class GeneralDVSRecorder:
                 self._write_blocked(grp, "y", ys)
                 self._write_blocked(grp, "t", ts)
                 self._write_blocked(grp, "p", ps)
+                self._write_blocked(grp, "q", qs)
 
         summary = ", ".join(f"{k}={v:,}" for k, v in counts.items())
         print(f"[Recorder] Saved Env {env_id} (Ep {episode_idx}) w/ {len(env_data)} cameras "

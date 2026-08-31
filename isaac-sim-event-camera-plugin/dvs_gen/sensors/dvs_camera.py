@@ -42,7 +42,7 @@ from isaaclab.utils import configclass
 
 from dvs_gen.dvs import GeneralDVSRecorder, BatchedMultiCamProcessor, DVSNoiseCfg, DVSNoiseModel
 from dvs_gen.io.blur import MotionBlurAccumulator, MotionBlurCfg
-from dvs_gen.warp import bidir_warp_gap
+from dvs_gen.warp import adaptive_warp_steps, bidir_warp_gap
 
 #: Isaac Lab annotator name for metric depth (per-pixel distance to image plane).
 DEPTH_ANNOTATOR = "distance_to_image_plane"
@@ -199,7 +199,8 @@ class DVSCamera:
     def __init__(self, scene, names, recorder, processors, *,
                  enable_warp=True, composite="log_blend", depth_key=DEPTH_ANNOTATOR,
                  margin=(0, 0, 0, 0), event_source="ldr", blur_cfgs=None, hole_fill=None,
-                 mv_dilate=1):
+                 mv_dilate=1, adaptive_warp=True, max_warp_factor=2,
+                 target_motion_px=1.0, target_log_step=None):
         self.scene = scene
         self.names = list(names)
         self.recorder = recorder
@@ -219,6 +220,7 @@ class DVSCamera:
         self.blur_cfgs = dict(blur_cfgs or {})
         self._blur_accs = {}
         self._blur_valid_masks = {}
+        self._blur_confidence_maps = {}
         # warp double-occlusion hole fill: None = black; a float = that constant;
         # "bg" = the frame's brightest value (auto white for a uniform bright backdrop).
         self.hole_fill = hole_fill
@@ -226,6 +228,13 @@ class DVSCamera:
         # each object's mv over its anti-aliased silhouette fringe so the warp does
         # not leave a faint ghost outline at the object's keyframe position. 0 = off.
         self.mv_dilate = mv_dilate
+        # v3: use the requested K as a minimum, then add temporal knots for a
+        # difficult gap. Threshold roots are solved continuously inside every
+        # resulting piecewise log-linear interval.
+        self.adaptive_warp = bool(adaptive_warp)
+        self.max_warp_factor = max(1, int(max_warp_factor))
+        self.target_motion_px = float(target_motion_px)
+        self.target_log_step = target_log_step
         # last timestamp seen by process() — used to infer the frame interval that
         # the motion-blur accumulator needs on the no-warp path.
         self._proc_prev_t = None
@@ -235,7 +244,9 @@ class DVSCamera:
     def from_scene(cls, scene, names=("cam0", "cam1"), *, out_dir="/tmp/dvs_dataset",
                    threshold=None, composite="log_blend", enable_warp=True,
                    group_prefix="DVS", margin=(0, 0, 0, 0), compression="gzip",
-                   event_source=None, hole_fill=None, mv_dilate=1, antialiasing="Off"):
+                   event_source=None, hole_fill=None, mv_dilate=1, antialiasing="Off",
+                   adaptive_warp=True, max_warp_factor=2, target_motion_px=1.0,
+                   target_log_step=None):
         """Build a recorder + one processor per camera and wrap ``scene``'s cameras.
 
         ``names`` are the camera keys in the scene (``scene[name]``); the events
@@ -307,7 +318,9 @@ class DVSCamera:
         return cls(scene, names, recorder, procs,
                    enable_warp=enable_warp, composite=composite, margin=margin,
                    event_source=event_source, blur_cfgs=blur_cfgs, hole_fill=hole_fill,
-                   mv_dilate=mv_dilate)
+                   mv_dilate=mv_dilate, adaptive_warp=adaptive_warp,
+                   max_warp_factor=max_warp_factor, target_motion_px=target_motion_px,
+                   target_log_step=target_log_step)
 
     def _crop(self, x):
         return crop_margin(x, self.margin)
@@ -390,18 +403,13 @@ class DVSCamera:
         called with the averaged (motion-blurred) frame each time a camera's
         ``motion_blur`` exposure window fills.
 
-        Returns the number of frames fed (``K``).
+        Returns the number of frames fed. With adaptive warp enabled this can be
+        larger than the requested ``K`` (up to ``K * max_warp_factor``), while
+        the keyframe gap duration and final timestamp remain unchanged.
         """
         names = self.names
-        # fraction 0: the real keyframe (cropped to the valid region)
-        frame0 = {n: self._crop(prev[n][0]) for n in names}
-        for name, proc in zip(names, self.procs):
-            self._feed(name, proc, frame0[name], t0, dt_fine, blur_cb)
-        if frame_cb is not None:
-            frame_cb(0, frame0)
-        if K == 1:
-            return 1
-
+        requested_K = int(K)
+        gap_dt = float(dt_fine) * requested_K
         Nenv = prev[names[0]][0].shape[0]
         A = torch.cat([prev[n][0] for n in names], 0)
         B = torch.cat([cur[n][0] for n in names], 0)
@@ -413,16 +421,39 @@ class DVSCamera:
         else:
             dA = dB = None
 
+        if self.adaptive_warp and requested_K > 1:
+            target_log_step = self.target_log_step
+            if target_log_step is None:
+                target_log_step = min(float(proc.threshold) for proc in self.procs)
+            K = adaptive_warp_steps(
+                A, B, mvA, mvB, requested_K,
+                max_factor=self.max_warp_factor,
+                target_motion_px=self.target_motion_px,
+                target_log_step=target_log_step,
+            )
+        else:
+            K = requested_K
+        dt_fine = gap_dt / K if K > 0 else 0.0
+
+        # fraction 0: the real keyframe (cropped to the valid region)
+        frame0 = {n: self._crop(prev[n][0]) for n in names}
+        for name, proc in zip(names, self.procs):
+            self._feed(name, proc, frame0[name], t0, dt_fine, blur_cb)
+        if frame_cb is not None:
+            frame_cb(0, frame0)
+        if K == 1:
+            return 1
+
         # warp runs on the FULL (over-rendered) frames so borders have real
         # neighbours; only the cropped valid region becomes events / RGB.
         hf = self.hole_fill
         if hf == "bg":                             # auto: brightest value = uniform bright backdrop
             hf = float(max(A.max(), B.max()))
-        mids, valid_mids = bidir_warp_gap(
+        mids, valid_mids, confidence_mids = bidir_warp_gap(
             A, B, mvA, mvB, K, self.composite,
             depthA=dA, depthB=dB, hole_fill=hf,
             mv_dilate=self.mv_dilate, covis_z=True,
-            return_validity=True,
+            return_confidence=True,
         )
         for i in range(K - 1):
             t = t0 + (i + 1) * dt_fine
@@ -432,13 +463,17 @@ class DVSCamera:
                 valid = self._crop(
                     valid_mids[i][ci * Nenv:(ci + 1) * Nenv, ..., None]
                 )[..., 0]
-                self._feed(name, proc, f, t, dt_fine, blur_cb, valid)
+                confidence = self._crop(
+                    confidence_mids[i][ci * Nenv:(ci + 1) * Nenv, ..., None]
+                )[..., 0]
+                self._feed(name, proc, f, t, dt_fine, blur_cb, valid, confidence)
                 frame_dict[name] = f
             if frame_cb is not None:
                 frame_cb(i + 1, frame_dict)
         return K
 
-    def _feed(self, name, proc, f, t, dt_fine, blur_cb, valid_mask=None):
+    def _feed(self, name, proc, f, t, dt_fine, blur_cb, valid_mask=None,
+              confidence=None):
         """Route one fine frame ``f`` (N,H,W,C) at time ``t`` for camera ``name``.
 
         No motion blur          -> the event model sees the sharp frame (as always).
@@ -449,19 +484,19 @@ class DVSCamera:
                                    RGB output via ``blur_cb``.
         ``blur_cb({name: env0_frame})`` fires whenever a window fills, either way.
         """
-        def feed_processor(frame, timestamp, validity):
-            if validity is None:
+        def feed_processor(frame, timestamp, validity, quality):
+            if validity is None and quality is None:
                 proc(frame, timestamp)
             else:
-                proc(frame, timestamp, validity)
+                proc(frame, timestamp, valid_mask=validity, confidence=quality)
 
         bc = self.blur_cfgs.get(name)
         if bc is None:
-            feed_processor(f, t, valid_mask)
+            feed_processor(f, t, valid_mask, confidence)
             return
         feed_ev = getattr(bc, "feed_events", False)
         if not feed_ev:
-            feed_processor(f, t, valid_mask)
+            feed_processor(f, t, valid_mask, confidence)
         acc = self._blur_accs.get(name)
         if acc is None:                              # lazy: window needs dt_fine
             win = max(1, int(round((bc.exposure_ms / 1000.0) / dt_fine)))
@@ -472,11 +507,18 @@ class DVSCamera:
             self._blur_valid_masks[name] = (
                 valid_mask.clone() if pending is None else pending & valid_mask
             )
+        if confidence is not None:
+            pending_q = self._blur_confidence_maps.get(name)
+            self._blur_confidence_maps[name] = (
+                confidence.clone() if pending_q is None
+                else torch.minimum(pending_q, confidence)
+            )
         avg = acc.add(f)                             # full batch (N,H,W,C)
         if avg is not None:
             avg_valid = self._blur_valid_masks.pop(name, None)
+            avg_confidence = self._blur_confidence_maps.pop(name, None)
             if feed_ev:
-                feed_processor(avg, t, avg_valid)    # events from the blurred frame
+                feed_processor(avg, t, avg_valid, avg_confidence)
             if blur_cb is not None:
                 blur_cb({name: avg[0]})              # env-0 for the video output
 
@@ -491,6 +533,7 @@ class DVSCamera:
                 out[name] = b[0] if b.dim() == 4 else b
         self._blur_accs = {}
         self._blur_valid_masks = {}
+        self._blur_confidence_maps = {}
         if out and blur_cb is not None:
             blur_cb(out)
 
