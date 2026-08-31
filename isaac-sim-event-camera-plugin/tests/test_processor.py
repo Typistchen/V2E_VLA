@@ -143,6 +143,25 @@ def test_noisy_path_is_globally_timestamp_sorted_across_pixels():
     assert torch.all(events["t"][1:] >= events["t"][:-1])
 
 
+def test_invalid_warp_pixel_is_suppressed_and_reanchored_on_recovery():
+    recorder = MemoryRecorder()
+    processor = BatchedMultiCamProcessor(recorder, "cam", threshold=0.15)
+    valid = torch.ones((1, 1, 1), dtype=torch.bool)
+    invalid = torch.zeros_like(valid)
+
+    processor(rgb_from_log(0.0), 0.0, valid)
+    processor(rgb_from_log(0.46), 1.0, invalid)
+    assert recorder.events()["p"].numel() == 0
+
+    # Recovery must establish a fresh reference without emitting the unknown
+    # accumulated change from the invalid interval.
+    processor(rgb_from_log(0.46), 2.0, valid)
+    assert recorder.events()["p"].numel() == 0
+
+    processor(rgb_from_log(0.62), 3.0, valid)
+    assert recorder.events()["p"].tolist() == [1]
+
+
 def test_recorder_writes_per_event_timestamps(tmp_path):
     recorder = GeneralDVSRecorder(str(tmp_path), compression=None)
     recorder.record(
