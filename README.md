@@ -19,10 +19,13 @@ Generated datasets and videos are intentionally not tracked.
 - EVIS event-video tooling: `3967743`
 - DynamicVLA EVIS integration: `df4526b`
 - EVIS photometric/occlusion-aware warp fix: `8ac5418`
+- Balanced dynamic-object-preserving warp mask: `e90175b`
 - Seed-2 halo evaluation report: `3161a4f`
 - DynamicVLA no-warp control support: `9dbea01`
 
-The `demo2` halo fix and its no-warp control are included. See
+The `demo2` halo fix and its no-warp control are included. The initial
+`8ac5418` mask is retained for comparison but deprecated because it can erase
+the manipulated object; use the balanced `e90175b` checkpoint. See
 `isaac-sim-event-camera-plugin/docs/photometric_warp_fix.md` for measured event
 counts, temporal-burst metrics, limitations, and the next VLA evaluation step.
 
