@@ -199,7 +199,7 @@ class DVSCamera:
     def __init__(self, scene, names, recorder, processors, *,
                  enable_warp=True, composite="log_blend", depth_key=DEPTH_ANNOTATOR,
                  margin=(0, 0, 0, 0), event_source="ldr", blur_cfgs=None, hole_fill=None,
-                 mv_dilate=1, adaptive_warp=True, max_warp_factor=2,
+                 mv_dilate=1, adaptive_warp=False, max_warp_factor=2,
                  target_motion_px=1.0, target_log_step=None):
         self.scene = scene
         self.names = list(names)
@@ -245,7 +245,7 @@ class DVSCamera:
                    threshold=None, composite="log_blend", enable_warp=True,
                    group_prefix="DVS", margin=(0, 0, 0, 0), compression="gzip",
                    event_source=None, hole_fill=None, mv_dilate=1, antialiasing="Off",
-                   adaptive_warp=True, max_warp_factor=2, target_motion_px=1.0,
+                   adaptive_warp=False, max_warp_factor=2, target_motion_px=1.0,
                    target_log_step=None):
         """Build a recorder + one processor per camera and wrap ``scene``'s cameras.
 
