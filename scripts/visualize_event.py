@@ -26,6 +26,12 @@ parser.add_argument("--interval_ms", type=float, default=5.0, help="time window 
 parser.add_argument("--height", type=int, default=480)
 parser.add_argument("--width", type=int, default=640)
 parser.add_argument("--out", type=str, default=None)
+parser.add_argument(
+    "--cams",
+    type=str,
+    default=None,
+    help="Comma-separated camera names; default: all cameras under /DVS.",
+)
 args = parser.parse_args()
 
 H, W = args.height, args.width
@@ -42,8 +48,11 @@ def frame_at(ev, t0, t1):
     """white canvas with events in [t0, t1): red = ON (p>0), blue = OFF."""
     x, y, t, p = ev
     img = np.full((H, W, 3), 255, np.uint8)
-    m = (t >= t0) & (t < t1)
-    xi, yi, pi = x[m], y[m], p[m]
+    # Recorder output is timestamp sorted.  Binary-searching the two window
+    # boundaries avoids scanning the complete event stream for every frame.
+    lo = np.searchsorted(t, t0, side="left")
+    hi = np.searchsorted(t, t1, side="left")
+    xi, yi, pi = x[lo:hi], y[lo:hi], p[lo:hi]
     keep = (xi >= 0) & (xi < W) & (yi >= 0) & (yi < H)
     xi, yi, pi = xi[keep], yi[keep], pi[keep]
     on, off = pi > 0, pi <= 0
@@ -55,7 +64,14 @@ def frame_at(ev, t0, t1):
 def main():
     h5_path = os.path.join(args.dir, f"env{args.env}_ep{args.eps}.h5")
     with h5py.File(h5_path, "r") as f:
-        cams = [c for c in ("cam0", "cam1") if f"DVS/{c}" in f]
+        cams = (
+            [c.strip() for c in args.cams.split(",") if c.strip()]
+            if args.cams
+            else sorted(f["DVS"].keys())
+        )
+        missing = [c for c in cams if f"DVS/{c}" not in f]
+        if missing:
+            raise KeyError(f"Cameras not found in {h5_path}: {missing}")
         evs = {c: load_cam(f, c) for c in cams}
 
     tmin = min(ev[2].min() for ev in evs.values())
