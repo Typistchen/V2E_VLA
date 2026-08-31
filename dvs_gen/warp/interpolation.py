@@ -228,6 +228,46 @@ def dilate_mv(mv, radius=1):
     return best_mv
 
 
+def adaptive_warp_steps(A, B, mvA, mvB, base_steps, *, max_factor=2,
+                        target_motion_px=1.0, target_log_step=0.15):
+    """Choose temporal knots for one keyframe gap from its observed difficulty.
+
+    The DVS processor solves every threshold-crossing time inside each interval,
+    so this function only needs to keep the piecewise log-intensity trajectory
+    sufficiently fine. It increases ``base_steps`` when the 99th-percentile
+    endpoint motion exceeds roughly one pixel per interval, or when the robust
+    (90th-percentile) endpoint log-luminance change exceeds one contrast
+    threshold per interval. The result is globally capped for predictable GPU
+    memory use.
+
+    Percentiles deliberately ignore a handful of renderer outliers while still
+    responding to a moving manipulation target or a broad HDR reflection.
+    """
+    base_steps = int(base_steps)
+    if base_steps <= 1 or int(max_factor) <= 1:
+        return max(1, base_steps)
+    max_steps = max(base_steps, base_steps * int(max_factor))
+
+    motion = torch.maximum(
+        torch.linalg.vector_norm(torch.nan_to_num(mvA), dim=-1),
+        torch.linalg.vector_norm(torch.nan_to_num(mvB), dim=-1),
+    ).float().reshape(-1)
+    motion_q = torch.quantile(motion, 0.99) if motion.numel() else motion.new_tensor(0.0)
+    motion_steps = int(torch.ceil(motion_q / max(float(target_motion_px), 1e-6)).item())
+
+    def log_luminance(frame):
+        rgb = torch.nan_to_num(frame[..., :3].float()).clamp_min(0.0)
+        lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+        return torch.log(lum + 1e-5)
+
+    log_change = (log_luminance(B) - log_luminance(A)).abs().reshape(-1)
+    log_q = torch.quantile(log_change, 0.90) if log_change.numel() else log_change.new_tensor(0.0)
+    photometric_steps = int(
+        torch.ceil(log_q / max(float(target_log_step), 1e-6)).item()
+    )
+    return min(max_steps, max(base_steps, motion_steps, photometric_steps))
+
+
 def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
                    depthA=None, depthB=None, hw=1.0, beta=12.0,
                    fill_holes=True, covis_z=False, hole_fill=None, mv_dilate=0,

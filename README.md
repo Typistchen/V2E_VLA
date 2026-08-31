@@ -134,6 +134,8 @@ from dvs_gen import GeneralDVSRecorder, BatchedMultiCamProcessor, bidir_warp_gap
     ```
 
 - **`DVSCamera`** — runtime bundle of the stereo cameras + per-camera event processors + recorder. `from_scene(...)`, `snapshot()`, `warp_and_process(...)`, `process(...)`, `reset(...)`, `flush(...)`. The warp batches **all cameras and all envs into a single** `bidir_warp_gap` call.
+  - **Adaptive temporal knots (v3)** — `from_scene(..., adaptive_warp=True)` treats the requested `K` as a minimum and increases it up to `K * max_warp_factor` for fast-motion or broad HDR-change gaps. Exact threshold-crossing times are then solved inside each piecewise log-linear interval. Set `adaptive_warp=False` for a fixed-K ablation.
+  - **Soft warp confidence (v3)** — depth/flow disagreement no longer deletes dynamic-object events. Every recorded event carries `q` in `[0,1]`; only true bidirectional coverage holes are hard-invalid. VLA loaders may use `q` as a voxel weight or an auxiliary quality channel.
   - **Anti-aliasing** — `from_scene(..., antialiasing="Off")` (the default) sets the RTX AA mode globally. Keep it `"Off"` with the warp: Isaac's default DLSS softens silhouette edges that then warp poorly and add ghosting/spurious events. Options: `"Off"`/`"FXAA"`/`"DLSS"`/`"TAA"`/`"DLAA"`, or `None` to leave it untouched.
 - **`DVSEnvCfg`** — a minimal, runnable env (one stereo pair, one dropped YCB object, randomized dome).
 
@@ -224,7 +226,7 @@ dvs_gen/                       # repo root
 
 ## Output format
 
-One HDF5 file per (env, episode): `env{e}_ep{ep}.h5`, with a group per camera (`DVS/cam0`, `DVS/cam1`) holding datasets `x` (uint16), `y` (uint16), `t` (float64 seconds), `p` (int8, +1 = ON / −1 = OFF).
+One HDF5 file per (env, episode): `env{e}_ep{ep}.h5`, with a group per camera (`DVS/cam0`, `DVS/cam1`) holding datasets `x` (uint16), `y` (uint16), `t` (float64 seconds), `p` (int8, +1 = ON / −1 = OFF), and `q` (float16 warp confidence in `[0,1]`; real-frame events default to `1`).
 
 
 

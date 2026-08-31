@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from dvs_gen.warp.interpolation import bidir_warp_gap
+from dvs_gen.warp.interpolation import adaptive_warp_steps, bidir_warp_gap
 
 
 def constant_frame(value, height=4, width=5):
@@ -112,3 +112,29 @@ def test_double_hole_has_zero_confidence():
 
     assert not torch.any(masks[0])
     assert torch.count_nonzero(confidence[0]) == 0
+
+
+def test_adaptive_steps_increase_for_fast_motion_but_stay_capped():
+    a = constant_frame(1.0)
+    b = constant_frame(1.0)
+    mv_a = torch.full_like(zero_motion(), 20.0)
+    mv_b = mv_a.clone()
+
+    assert adaptive_warp_steps(a, b, mv_a, mv_b, 4, max_factor=2) == 8
+
+
+def test_adaptive_steps_keep_base_for_easy_gap():
+    a = constant_frame(1.0)
+    mv = zero_motion()
+
+    assert adaptive_warp_steps(a, a, mv, mv, 4, max_factor=2) == 4
+
+
+def test_adaptive_steps_respond_to_broad_photometric_change():
+    a = constant_frame(1.0)
+    b = constant_frame(math.exp(0.9))
+    mv = zero_motion()
+
+    assert adaptive_warp_steps(
+        a, b, mv, mv, 4, max_factor=2, target_log_step=0.15
+    ) == 6
