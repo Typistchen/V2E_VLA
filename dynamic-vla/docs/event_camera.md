@@ -11,8 +11,9 @@ Install the local plugin into the IsaacLab environment:
 ```
 
 Generate one episode with three 360x480 DOM event cameras. The base cameras run
-at 25 Hz and `--event_warp 4` uses motion-vector interpolation to emit events at
-100 Hz:
+at 25 Hz and `--event_warp 4` requests at least four temporal intervals per
+keyframe gap. EVIS v3 adaptively raises difficult motion/HDR gaps to at most
+eight intervals (`--event_max_warp_factor 2`):
 
 ```bash
 OMNI_KIT_ACCEPT_EULA=YES \
@@ -27,5 +28,10 @@ OMNI_KIT_ACCEPT_EULA=YES \
 
 Event files are written under `<output_dir>/events/env<id>_ep<seed>.h5`. Each
 contains `DVS/wrist_cam`, `DVS/opst_cam`, and `DVS/side_cam`, with `x`, `y`, `t`,
-and `p` datasets. Set `--event_warp 1` to disable interpolation or
-`--event_source ldr` to generate events from tone-mapped RGB instead of HDR.
+`p`, and `q` datasets. `q` is the per-event soft warp confidence: `0` is
+unobservable, visible synthesized events are in `[0.5,1]`, and real samples
+default to `1`. DynamicVLA can use it as a voxel weight or auxiliary channel;
+do not hard-threshold it, because uncertain cup/robot edges are task-relevant.
+Set `--no-event_adaptive_warp` for the fixed-K v2 comparison,
+`--event_warp 1` to disable interpolation, or `--event_source ldr` to generate
+events from tone-mapped RGB instead of HDR.
