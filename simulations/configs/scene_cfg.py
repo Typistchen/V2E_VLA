@@ -65,7 +65,14 @@ class SceneCfg(InteractiveSceneCfg):
     )
 
 
-def get_camera_cfg(cam_cfg: dict, cam_extra_cfg: dict = {}) -> SceneCfg:
+def get_camera_cfg(
+    cam_cfg: dict,
+    cam_extra_cfg: dict = {},
+    event_camera: bool = False,
+    event_threshold: float = 0.15,
+    event_source: str = "hdr",
+    event_warp: bool = True,
+) -> SceneCfg:
     for k, v in cam_extra_cfg.items():
         cam_cfg[k] = v
 
@@ -77,7 +84,19 @@ def get_camera_cfg(cam_cfg: dict, cam_extra_cfg: dict = {}) -> SceneCfg:
     if "convention" not in cam_cfg:
         cam_cfg["convention"] = "ros"
 
-    camera_cfg = CameraCfg(
+    camera_cls = CameraCfg
+    event_kwargs = {}
+    if event_camera:
+        from dvs_gen.sensors import DVSCameraCfg
+
+        camera_cls = DVSCameraCfg
+        event_kwargs = {
+            "threshold": event_threshold,
+            "event_source": event_source,
+            "enable_warp": event_warp,
+        }
+
+    camera_cfg = camera_cls(
         prim_path="{ENV_REGEX_NS}" + cam_cfg["prim_path"],
         update_period=1 / cam_cfg["fps"],
         height=cam_cfg["height"],
@@ -89,9 +108,10 @@ def get_camera_cfg(cam_cfg: dict, cam_extra_cfg: dict = {}) -> SceneCfg:
             horizontal_aperture=cam_cfg["horizontal_aperture"],
             clipping_range=(cam_cfg["clip"]["near"], cam_cfg["clip"]["far"]),
         ),
-        offset=CameraCfg.OffsetCfg(
+        offset=camera_cls.OffsetCfg(
             pos=cam_cfg["pos"], rot=cam_cfg["quat"], convention=cam_cfg["convention"]
         ),
+        **event_kwargs,
     )
     return camera_cfg
 

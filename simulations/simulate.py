@@ -238,7 +238,12 @@ def _set_up_scene_cameras(scene_cfg, sim_cfg, robot):
         scene_cfg,
         "wrist_cam",
         configs.scene_cfg.get_camera_cfg(
-            sim_cfg["camera"].copy(), configs.robot_cfg.get_wrist_camera_cfg(robot)
+            sim_cfg["camera"].copy(),
+            configs.robot_cfg.get_wrist_camera_cfg(robot),
+            event_camera=sim_cfg["event_camera"],
+            event_threshold=sim_cfg["event_threshold"],
+            event_source=sim_cfg["event_source"],
+            event_warp=sim_cfg["event_warp"] > 1,
         ),
     )
     # Set up the cameras according to relative position in the config file
@@ -249,6 +254,10 @@ def _set_up_scene_cameras(scene_cfg, sim_cfg, robot):
             configs.scene_cfg.get_camera_cfg(
                 sim_cfg["camera"].copy(),
                 get_camera_pose(cam),
+                event_camera=sim_cfg["event_camera"],
+                event_threshold=sim_cfg["event_threshold"],
+                event_source=sim_cfg["event_source"],
+                event_warp=sim_cfg["event_warp"] > 1,
             ),
         )
     return scene_cfg
@@ -885,6 +894,26 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
     # Reset environment at start
     env.reset(seed=seed)
 
+    # Wrap the existing DOM cameras with the event-camera pipeline. The cameras
+    # keep their original placement and RGB/segmentation output; DVSCameraCfg
+    # only adds the HDR, motion-vector and depth annotators needed for events.
+    dvs = None
+    dvs_prev = None
+    dvs_t_prev = None
+    if sim_cfg["event_camera"]:
+        from dvs_gen.sensors import DVSCamera
+
+        camera_names = ["wrist_cam"] + [
+            cam["name"] for cam in sim_cfg["scene"]["cameras"]
+        ]
+        dvs = DVSCamera.from_scene(
+            env.unwrapped.scene,
+            camera_names,
+            out_dir=sim_cfg["event_output_dir"],
+        )
+        dvs_prev = dvs.snapshot()
+        dvs_t_prev = float(env.unwrapped.sim.current_time)
+
     # Determine the object size (without transformation)
     if "container" in env.unwrapped.scene.keys():
         container_data = env.unwrapped.scene["container"].data
@@ -978,6 +1007,22 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
             env.unwrapped.scene.sensors, ["rgb", "depth", "seg"]
         )
         env.step(next_state["action"])
+        if dvs is not None:
+            dvs_cur = dvs.snapshot()
+            event_warp = sim_cfg["event_warp"]
+            dvs_t_cur = float(env.unwrapped.sim.current_time)
+            if event_warp > 1:
+                dvs.warp_and_process(
+                    dvs_prev,
+                    dvs_cur,
+                    event_warp,
+                    dvs_t_prev,
+                    max(0.0, dvs_t_cur - dvs_t_prev) / event_warp,
+                )
+            else:
+                dvs.process(dvs_t_cur)
+            dvs_prev = dvs_cur
+            dvs_t_prev = dvs_t_cur
         env_states.append(
             {
                 "cam_views": cam_views,
@@ -989,6 +1034,9 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
         )
 
     env_states = get_env_states(env_states, env.unwrapped.num_envs)
+    if dvs is not None:
+        for env_id in range(env.unwrapped.num_envs):
+            dvs.flush(env_id, seed)
     env.close()
     # Ignore the simulation if the task is not finished
     # If in debug mode, save all simulation data even if the task is not finishedq
@@ -1219,6 +1267,11 @@ def main(args):
             "disable_fabric": args.disable_fabric,
             "disable_sm": args.disable_sm,
             "enable_cameras": args.enable_cameras,
+            "event_camera": args.event_camera,
+            "event_output_dir": args.event_output_dir,
+            "event_source": args.event_source,
+            "event_threshold": args.event_threshold,
+            "event_warp": args.event_warp,
             "num_envs": args.num_envs,
             "path_tracing": args.path_tracing,
         }
@@ -1259,9 +1312,9 @@ def main(args):
             # 1) The object is stopped within a few steps due to collision
             # 2) The initial object velocity is changed due to collision
             env_cfg = env_cfg.to_dict()
-            if is_object_stopped(env_cfg["scene"], es["object_vel"]):
+            if is_object_stopped(env_cfg["scene"], es["object_vel"]) and not sim_cfg["debug"]:
                 continue
-            if is_object_direction_changed(env_cfg["scene"], es["object_vel"]):
+            if is_object_direction_changed(env_cfg["scene"], es["object_vel"]) and not sim_cfg["debug"]:
                 # Remove direction tags
                 object_tags["objects"] = [
                     t for t in object_tags["objects"] if not t.endswith("direction")
@@ -1347,9 +1400,44 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--disable_sm", action="store_true", default=False)
     parser.add_argument("--path_tracing", action="store_true", default=False)
+    parser.add_argument(
+        "--event_camera",
+        action="store_true",
+        default=False,
+        help="Generate DVS events from all DOM cameras with the EVIS plugin.",
+    )
+    parser.add_argument(
+        "--event_output_dir",
+        default=None,
+        help="Directory for event HDF5 files (default: <output_dir>/events).",
+    )
+    parser.add_argument(
+        "--event_source",
+        choices=["hdr", "ldr"],
+        default="hdr",
+        help="Intensity source used by the event model.",
+    )
+    parser.add_argument(
+        "--event_threshold",
+        type=float,
+        default=0.15,
+        help="Log-intensity contrast threshold that emits an event.",
+    )
+    parser.add_argument(
+        "--event_warp",
+        type=int,
+        default=4,
+        help="Motion-vector interpolation multiplier (25 Hz x 4 = 100 Hz).",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("-n", "--n_simulations", type=int, default=10_000)
     args = parser.parse_args(script_args)
+    if args.event_output_dir is None:
+        args.event_output_dir = os.path.join(args.output_dir, "events")
+    if args.event_camera and not getattr(isaaclab_args, "enable_cameras", False):
+        parser.error("--event_camera requires --enable_cameras")
+    if args.event_warp < 1:
+        parser.error("--event_warp must be at least 1")
     # Copy the shared parameters from isaaclab_args to args
     for sp in SHARED_PARAMETERS:
         if sp in isaaclab_args:
