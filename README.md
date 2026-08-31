@@ -18,8 +18,12 @@ Generated datasets and videos are intentionally not tracked.
 - EVIS Isaac/H.264 compatibility: `50a1a7c`
 - EVIS event-video tooling: `3967743`
 - DynamicVLA EVIS integration: `df4526b`
+- EVIS photometric/occlusion-aware warp fix: `8ac5418`
+- Seed-2 halo evaluation report: `3161a4f`
+- DynamicVLA no-warp control support: `9dbea01`
 
-The photometric/occlusion-aware warp fix discussed for the `demo2` halo
-artifact is not included yet and should be developed as a separate commit.
+The `demo2` halo fix and its no-warp control are included. See
+`isaac-sim-event-camera-plugin/docs/photometric_warp_fix.md` for measured event
+counts, temporal-burst metrics, limitations, and the next VLA evaluation step.
 
 See `dynamic-vla/docs/event_camera.md` for setup and generation commands.
