@@ -19,7 +19,7 @@ eight intervals (`--event_max_warp_factor 2`):
 OMNI_KIT_ACCEPT_EULA=YES \
 /home/typist/miniconda3/envs/isaaclab/bin/python simulations/simulate.py \
   --headless --enable_cameras --num_envs 1 -n 1 --task pick --seed 44 \
-  --save --debug --event_camera --event_warp 4 \
+  --save --debug --event_camera --event_warp 4 --event_adaptive_warp \
   --event_source hdr --event_threshold 0.15 \
   --scene_dir /home/typist/dataset/dom_simulation/tests/DOM-Test/scenes \
   --object_dir /home/typist/dataset/dom_simulation/objects/DOM-3D-Objects/objects \

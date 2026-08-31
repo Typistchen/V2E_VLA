@@ -1438,7 +1438,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--event_adaptive_warp",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "Adapt temporal warp knots to motion/HDR change. Use "
             "--no-event_adaptive_warp for the fixed-K v2 ablation."
