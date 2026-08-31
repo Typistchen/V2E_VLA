@@ -38,7 +38,14 @@ class GeneralDVSRecorder:
         # Nested dictionary: env_id -> camera_name -> list of events
         self._events = defaultdict(lambda: defaultdict(list))
 
-    def record(self, camera_name: str, env_ids: torch.Tensor, xs: torch.Tensor, ys: torch.Tensor, ps: torch.Tensor, t: float):
+    def record(self, camera_name: str, env_ids: torch.Tensor, xs: torch.Tensor,
+               ys: torch.Tensor, ps: torch.Tensor, t):
+        """Buffer an event batch.
+
+        ``t`` may be one scalar timestamp (legacy callers) or one timestamp per
+        event.  Per-event timestamps are required when a single intensity update
+        crosses several contrast thresholds.
+        """
         if xs.numel() == 0: return
 
         # One GPU->CPU transfer per array, then store whole array-chunks per env
@@ -47,16 +54,28 @@ class GeneralDVSRecorder:
         x_np = xs.cpu().numpy().astype(np.uint16)
         y_np = ys.cpu().numpy().astype(np.uint16)
         p_np = ps.cpu().numpy().astype(np.int8)
+        if torch.is_tensor(t):
+            t_np = t.detach().cpu().numpy().astype(np.float64)
+        else:
+            t_np = np.asarray(t, dtype=np.float64)
+        if t_np.ndim == 0:
+            t_np = np.full(x_np.shape, float(t_np), np.float64)
+        else:
+            t_np = t_np.reshape(-1)
+            if t_np.shape != x_np.shape:
+                raise ValueError(
+                    f"Expected one timestamp per event ({x_np.shape}), got {t_np.shape}."
+                )
 
         with self._lock:
             if e_np.size and e_np.min() == e_np.max():     # fast path: all events in one env (num_envs=1)
                 self._events[int(e_np[0])][camera_name].append(
-                    (x_np, y_np, np.full(x_np.shape, t, np.float64), p_np))
+                    (x_np, y_np, t_np, p_np))
             else:
                 for e in np.unique(e_np):                   # group by env, still array-wise (no per-event loop)
                     m = e_np == e
                     self._events[int(e)][camera_name].append(
-                        (x_np[m], y_np[m], np.full(int(m.sum()), t, np.float64), p_np[m]))
+                        (x_np[m], y_np[m], t_np[m], p_np[m]))
 
     def flush_episode(self, env_id: int, episode_idx: int):
         """Flushes all cameras for a single environment to a single HDF5 file."""

@@ -114,14 +114,38 @@ class DVSNoiseModel:
         return self.theta_on, self.theta_off
 
     # ── background events + hot pixels + refractory (hook 2) ─────
+    def _ensure_event_state(self, shape, device):
+        if self.theta_on is None:
+            self.thresholds(shape[1:], device)
+        if self.last_t is None:
+            self.last_t = torch.full(shape, -1e30, device=device)
+
+    def apply_signal_refractory(self, pos_mask, neg_mask, event_time):
+        """Apply dead time to one chronological threshold-crossing layer.
+
+        ``event_time`` is a tensor matching the masks.  The processor invokes
+        this method for crossing 1, 2, ... so each pixel is filtered in temporal
+        order even when several events occur between two rendered frames.
+        """
+        self._ensure_event_state(pos_mask.shape, pos_mask.device)
+        neg_mask = neg_mask & ~pos_mask
+        if self.cfg.refractory_s <= 0.0:
+            fired = pos_mask | neg_mask
+            self.last_t = torch.where(fired, event_time, self.last_t)
+            return pos_mask, neg_mask
+
+        ready = (event_time - self.last_t) >= self.cfg.refractory_s
+        pos_mask = pos_mask & ready
+        neg_mask = neg_mask & ready
+        fired = pos_mask | neg_mask
+        self.last_t = torch.where(fired, event_time, self.last_t)
+        return pos_mask, neg_mask
+
     def apply(self, pos_mask, neg_mask, intensity, current_time):
         """Take the signal masks, add sensor-noise events, enforce refractory.
         ``intensity`` is (num_envs, H, W) linear luminance; masks are the same shape."""
         device = pos_mask.device
-        if self.theta_on is None:                       # ensure fixed pattern exists
-            self.thresholds(pos_mask.shape[1:], device)
-        if self.last_t is None:
-            self.last_t = torch.full(pos_mask.shape, -1e30, device=device)
+        self._ensure_event_state(pos_mask.shape, device)
 
         dt = 0.0 if self.prev_t is None else max(0.0, current_time - self.prev_t)
         self.prev_t = current_time
