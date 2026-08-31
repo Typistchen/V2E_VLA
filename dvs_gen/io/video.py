@@ -9,6 +9,7 @@ to the system ffmpeg (libx264) so the output is H.264
     vw.release()
 """
 import subprocess
+import shutil
 
 import cv2
 import numpy as np
@@ -18,9 +19,19 @@ class H264Writer:
     def __init__(self, path, width, height, fps):
         self._cv2 = None
         self.p = None
+        ffmpeg_exe = shutil.which("ffmpeg")
+        if ffmpeg_exe is None:
+            try:
+                import imageio_ffmpeg
+
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            except (ImportError, RuntimeError):
+                pass
         try:
+            if ffmpeg_exe is None:
+                raise FileNotFoundError("ffmpeg executable not found")
             self.p = subprocess.Popen(
-                ["ffmpeg", "-y", "-loglevel", "error",
+                [ffmpeg_exe, "-y", "-loglevel", "error",
                  "-f", "rawvideo", "-pix_fmt", "bgr24",
                  "-s", f"{int(width)}x{int(height)}", "-r", str(fps), "-i", "-",
                  "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", path],

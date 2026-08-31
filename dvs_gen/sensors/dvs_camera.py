@@ -93,7 +93,11 @@ def tag_dvs_cameras(scene, names, threshold=0.15):
         for n in names:
             sensor = scene[n]
             # Resolved per-env prim paths; fall back to env paths + cfg suffix.
-            paths = list(getattr(sensor, "prim_paths", None) or [])
+            paths = [
+                p
+                for p in (getattr(sensor, "prim_paths", None) or [])
+                if ".*" not in p and "{" not in p
+            ]
             if not paths:
                 suffix = getattr(getattr(sensor, "cfg", None), "prim_path", "").split("}")[-1]
                 paths = [ep + suffix for ep in getattr(scene, "env_prim_paths", [])]
