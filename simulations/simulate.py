@@ -911,6 +911,8 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
             camera_names,
             out_dir=sim_cfg["event_output_dir"],
             enable_warp=sim_cfg["event_warp"] > 1,
+            adaptive_warp=sim_cfg["event_adaptive_warp"],
+            max_warp_factor=sim_cfg["event_max_warp_factor"],
         )
         if sim_cfg["event_warp"] > 1:
             dvs_prev = dvs.snapshot()
@@ -1274,6 +1276,8 @@ def main(args):
             "event_source": args.event_source,
             "event_threshold": args.event_threshold,
             "event_warp": args.event_warp,
+            "event_adaptive_warp": args.event_adaptive_warp,
+            "event_max_warp_factor": args.event_max_warp_factor,
             "num_envs": args.num_envs,
             "path_tracing": args.path_tracing,
         }
@@ -1431,6 +1435,21 @@ if __name__ == "__main__":
         default=4,
         help="Motion-vector interpolation multiplier (25 Hz x 4 = 100 Hz).",
     )
+    parser.add_argument(
+        "--event_adaptive_warp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Adapt temporal warp knots to motion/HDR change. Use "
+            "--no-event_adaptive_warp for the fixed-K v2 ablation."
+        ),
+    )
+    parser.add_argument(
+        "--event_max_warp_factor",
+        type=int,
+        default=2,
+        help="Maximum adaptive knots as a multiple of --event_warp (default: 2).",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("-n", "--n_simulations", type=int, default=10_000)
     args = parser.parse_args(script_args)
@@ -1440,6 +1459,8 @@ if __name__ == "__main__":
         parser.error("--event_camera requires --enable_cameras")
     if args.event_warp < 1:
         parser.error("--event_warp must be at least 1")
+    if args.event_max_warp_factor < 1:
+        parser.error("--event_max_warp_factor must be at least 1")
     # Copy the shared parameters from isaaclab_args to args
     for sp in SHARED_PARAMETERS:
         if sp in isaaclab_args:
