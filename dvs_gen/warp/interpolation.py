@@ -421,9 +421,14 @@ def bidir_warp_gap(A, B, mvA, mvB, K, composite="b_primary",
         agreement_conf = torch.sqrt(depth_conf * torch.sqrt(flow_conf))
     else:
         agreement_conf = flow_conf
+    # A visible pixel always has at least one actual rendered endpoint, so its
+    # score must not approach zero merely because a rotating/accelerating object
+    # disagrees across endpoints. Reserve [0,0.5) for unobservable regions and
+    # map endpoint agreement into [0.5,1]. This keeps confidence weighting from
+    # erasing exactly the cup/robot boundaries needed by a manipulation policy.
     confidence = torch.where(
         both,
-        agreement_conf,
+        0.5 + 0.5 * agreement_conf,
         torch.full_like(agreement_conf, 0.5),
     )
     confidence = torch.where(has_a | has_b, confidence, torch.zeros_like(confidence))

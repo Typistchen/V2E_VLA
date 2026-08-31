@@ -13,7 +13,7 @@ HDF5 layout (one file ``env{env_id}_ep{episode_idx}.h5`` per environment)::
     /<camera_name>/y   uint16   (gzip)  pixel y
     /<camera_name>/t   float64  (gzip)  timestamp (seconds)
     /<camera_name>/p   int8     (gzip)  polarity  (+1 = ON, -1 = OFF)
-    /<camera_name>/q   float16  (gzip)  warp confidence in [0,1]
+    /<camera_name>/q   float16  (gzip)  warp confidence (0=hole, visible>=0.5)
 """
 import os
 import threading

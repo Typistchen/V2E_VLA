@@ -74,7 +74,7 @@ def test_only_double_coverage_holes_are_invalid():
     assert not torch.any(masks[0])
 
 
-def test_confidence_is_soft_metadata_not_a_dynamic_object_gate():
+def test_dynamic_disagreement_keeps_nonzero_confidence_floor():
     a = constant_frame(1.0)
     b = constant_frame(4.0)
     mv = zero_motion()
@@ -94,7 +94,8 @@ def test_confidence_is_soft_metadata_not_a_dynamic_object_gate():
     )
 
     assert torch.all(masks[0])
-    assert torch.all(confidence[0] < 0.1)
+    assert torch.all(confidence[0] >= 0.5)
+    assert torch.all(confidence[0] < 0.55)
     assert torch.allclose(frames[0], a[0])
 
 
