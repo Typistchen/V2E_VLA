@@ -900,6 +900,7 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
     dvs = None
     dvs_prev = None
     dvs_t_prev = None
+    dvs_t_origin = None
     if sim_cfg["event_camera"]:
         from dvs_gen.sensors import DVSCamera
 
@@ -917,6 +918,7 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
         if sim_cfg["event_warp"] > 1:
             dvs_prev = dvs.snapshot()
         dvs_t_prev = float(env.unwrapped.sim.current_time)
+        dvs_t_origin = dvs_t_prev
 
     # Determine the object size (without transformation)
     if "container" in env.unwrapped.scene.keys():
@@ -1040,7 +1042,7 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
     env_states = get_env_states(env_states, env.unwrapped.num_envs)
     if dvs is not None:
         for env_id in range(env.unwrapped.num_envs):
-            dvs.flush(env_id, seed)
+            dvs.flush(env_id, seed, time_origin_s=dvs_t_origin)
     env.close()
     # Ignore the simulation if the task is not finished
     # If in debug mode, save all simulation data even if the task is not finishedq
