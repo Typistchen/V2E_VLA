@@ -165,6 +165,28 @@ Example configuration file: `simulations/configs/sim_cfg.yaml`
 -   `-n`, `--n_simulations`: number of simulation episodes to generate *(default: `10,000`)*.
 -   `--save`: save generated simulation data in HDF5 format.
 
+#### EVIS event-camera modes
+
+When the local EVIS plugin is installed, the balanced v2 path remains the
+default event mode. v3 and v4 are explicit experiments:
+
+```bash
+# v2: fixed-K balanced baseline
+python3 simulations/simulate.py --enable_cameras --event_camera --event_warp 4 ...
+
+# v3: adaptive continuous timing
+python3 simulations/simulate.py --enable_cameras --event_camera --event_warp 4 \
+    --event_adaptive_warp ...
+
+# v4 hybrid: v3 timing + conservative weak-warp-event gate
+python3 simulations/simulate.py --enable_cameras --event_camera --event_warp 4 \
+    --event_hybrid --event_hybrid_gate_gain 0.25 \
+    --event_hybrid_support_radius 2 ...
+```
+
+`--event_hybrid` automatically enables adaptive temporal knots. It does not
+replace the v2 default until a multi-episode evaluation supports promotion.
+
 ### Trajectory Replay
 
 After data generation, convert the trajectories into a format compatible with VLA training:
