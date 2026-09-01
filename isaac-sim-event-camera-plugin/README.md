@@ -44,6 +44,29 @@ This extension saves rendering cost by rendering sparse keyframes and warping th
  synthesised frames @render_hz×warp ──▶ event model ──▶ events (HDF5)
 ```
 
+## Validation
+
+The source-level evaluator supports explicit Isaac-to-episode timestamp
+alignment and strict JSON output. For paired multi-episode comparisons, average
+cameras within each episode before treating episodes as statistical replicates:
+
+```bash
+python scripts/evaluate_evis_versions.py \
+  --v2-events /path/v2-events.h5 --v2-episode /path/v2-episode.h5 \
+  --v3-events /path/v3-events.h5 --v3-episode /path/v3-episode.h5 \
+  --event-time-origin-s 0.07 \
+  --out-json /tmp/evis_demo.json --out-md /tmp/evis_demo.md
+
+python scripts/aggregate_evis_reports.py \
+  --input-glob '/tmp/evis_demo*.json' \
+  --out-json /tmp/evis_summary.json --out-md /tmp/evis_summary.md
+```
+
+New recorder files store `event_time_origin_s` automatically when the caller
+passes the episode's initial Isaac simulation time to `DVSCamera.flush()`, so
+the explicit evaluator argument is only needed for older files. See the
+[aligned 10-episode report](report/ten_episode_v2_v3_aligned_metrics.md).
+
 ## 🚀 Quickstart
 
 > `python` means the Isaac Sim Python. If you don't use a virtual python environment, replace `python` with `${ISAACLAB}/isaaclab.sh -p` in every command below.

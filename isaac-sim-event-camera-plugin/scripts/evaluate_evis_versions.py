@@ -13,7 +13,14 @@ Example::
       --v2-episode /path/v2/episode.h5 \
       --v3-events /path/v3/events/env0_ep2.h5 \
       --v3-episode /path/v3/episode.h5 \
+      --event-time-origin-s 0.07 \
       --out-json /tmp/evis_metrics.json --out-md /tmp/evis_metrics.md
+
+``--event-time-origin-s`` converts Isaac's absolute simulation timestamps to
+episode-relative time.  Per-version overrides are available when two captures
+started at different simulation times.  If no CLI value is supplied, the
+evaluator reads ``event_time_origin_s``/``time_origin_s`` from the event HDF5
+root or ``/DVS`` attributes, and finally falls back to zero.
 """
 from __future__ import annotations
 
@@ -36,8 +43,17 @@ def _safe_ratio(num: float, den: float) -> float:
     return float(num / den) if den > 0 else float("nan")
 
 
-def _round_float(value):
-    return None if not np.isfinite(value) else float(value)
+def _json_safe(value):
+    """Recursively replace non-finite numbers so output is strict JSON."""
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
 
 
 def _event_group(stream: h5py.File, camera: str):
@@ -50,6 +66,19 @@ def _camera_names(path: str) -> list[str]:
     return [camera for camera in CAMERA_ORDER if camera in present] + sorted(
         present - set(CAMERA_ORDER)
     )
+
+
+def _resolve_time_origin(path: str, cli_value: float | None):
+    if cli_value is not None:
+        return float(cli_value), "cli"
+    with h5py.File(path, "r") as stream:
+        for owner_name, owner in (("root", stream), ("DVS", stream.get("DVS"))):
+            if owner is None:
+                continue
+            for key in ("event_time_origin_s", "time_origin_s"):
+                if key in owner.attrs:
+                    return float(owner.attrs[key]), f"hdf5:{owner_name}:{key}"
+    return 0.0, "default_zero"
 
 
 def _harmonic_metrics(times: np.ndarray, duration: float, keyframe_hz: float):
@@ -88,7 +117,13 @@ def _harmonic_metrics(times: np.ndarray, duration: float, keyframe_hz: float):
     }
 
 
-def summarize_events(path: str, cameras: list[str], duration: float, keyframe_hz: float):
+def summarize_events(
+    path: str,
+    cameras: list[str],
+    duration: float,
+    keyframe_hz: float,
+    time_origin_s: float,
+):
     result = {
         "path": path,
         "file_bytes": os.path.getsize(path),
@@ -98,7 +133,8 @@ def summarize_events(path: str, cameras: list[str], duration: float, keyframe_hz
     with h5py.File(path, "r") as stream:
         for camera in cameras:
             group = _event_group(stream, camera)
-            times = group["t"][:]
+            raw_times = group["t"][:]
+            times = raw_times - time_origin_s
             polarity = group["p"][:]
             n_events = int(times.size)
             n_on = int(np.count_nonzero(polarity > 0))
@@ -115,8 +151,14 @@ def summarize_events(path: str, cameras: list[str], duration: float, keyframe_hz
                 "off_events": n_off,
                 "polarity_imbalance": _safe_ratio(abs(n_on - n_off), n_events),
                 "timestamps_monotonic": bool(np.all(times[1:] >= times[:-1])),
+                "timestamp_origin_s": time_origin_s,
                 "timestamp_min_s": float(times[0]) if n_events else None,
                 "timestamp_max_s": float(times[-1]) if n_events else None,
+                "timestamp_min_raw_s": float(raw_times[0]) if n_events else None,
+                "timestamp_max_raw_s": float(raw_times[-1]) if n_events else None,
+                "events_in_analysis_window": int(
+                    np.count_nonzero((times >= 0.0) & (times <= duration))
+                ),
                 "count_10ms_cv": _safe_ratio(float(counts.std()), float(counts.mean())),
                 "phase_10ms_means": phase_means,
                 "phase_10ms_imbalance": _safe_ratio(max(phase_means), min(phase_means)),
@@ -167,7 +209,13 @@ def _log_luminance(rgb: np.ndarray):
     return np.log(lum + 1.0)
 
 
-def roi_proxy_metrics(event_path: str, episode_path: str, cameras: list[str], frame_dt: float):
+def roi_proxy_metrics(
+    event_path: str,
+    episode_path: str,
+    cameras: list[str],
+    frame_dt: float,
+    time_origin_s: float,
+):
     """Compute segmentation/RGB-supported proxies, not oracle accuracy metrics."""
     output = {}
     with h5py.File(event_path, "r") as events, h5py.File(episode_path, "r") as episode:
@@ -175,7 +223,7 @@ def roi_proxy_metrics(event_path: str, episode_path: str, cameras: list[str], fr
             group = _event_group(events, camera)
             xs = group["x"][:].astype(np.int32)
             ys = group["y"][:].astype(np.int32)
-            times = group["t"][:]
+            times = group["t"][:] - time_origin_s
             quality = group["q"][:].astype(np.float32) if "q" in group else None
             seg_ds = episode[f"{camera}_seg"]
             rgb_ds = episode[f"{camera}_rgb"]
@@ -293,18 +341,37 @@ def roi_proxy_metrics(event_path: str, episode_path: str, cameras: list[str], fr
     return output
 
 
-def _occupied_voxels(group, width: int, height: int, spatial_px: int, temporal_ms: int):
-    x = group["x"][:].astype(np.int64) // spatial_px
-    y = group["y"][:].astype(np.int64) // spatial_px
-    t = np.floor(group["t"][:] / (temporal_ms * 1e-3)).astype(np.int64)
-    p = (group["p"][:] > 0).astype(np.int64)
+def _occupied_voxels(
+    group,
+    width: int,
+    height: int,
+    spatial_px: int,
+    temporal_ms: int,
+    time_origin_s: float,
+    duration_s: float,
+):
+    event_time = group["t"][:] - time_origin_s
+    valid = (event_time >= 0.0) & (event_time <= duration_s)
+    x = group["x"][:][valid].astype(np.int64) // spatial_px
+    y = group["y"][:][valid].astype(np.int64) // spatial_px
+    t = np.floor(event_time[valid] / (temporal_ms * 1e-3)).astype(np.int64)
+    p = (group["p"][:][valid] > 0).astype(np.int64)
     nx = math.ceil(width / spatial_px)
     ny = math.ceil(height / spatial_px)
     code = (((t * ny + y) * nx + x) << 1) | p
     return np.unique(code)
 
 
-def voxel_agreement(v2_path: str, v3_path: str, cameras: list[str], width: int, height: int):
+def voxel_agreement(
+    v2_path: str,
+    v3_path: str,
+    cameras: list[str],
+    width: int,
+    height: int,
+    v2_time_origin_s: float,
+    v3_time_origin_s: float,
+    duration_s: float,
+):
     configs = ((1, 1), (2, 2), (4, 5))
     result = {}
     with h5py.File(v2_path, "r") as v2, h5py.File(v3_path, "r") as v3:
@@ -312,10 +379,22 @@ def voxel_agreement(v2_path: str, v3_path: str, cameras: list[str], width: int, 
             camera_result = {}
             for spatial_px, temporal_ms in configs:
                 a = _occupied_voxels(
-                    _event_group(v2, camera), width, height, spatial_px, temporal_ms
+                    _event_group(v2, camera),
+                    width,
+                    height,
+                    spatial_px,
+                    temporal_ms,
+                    v2_time_origin_s,
+                    duration_s,
                 )
                 b = _occupied_voxels(
-                    _event_group(v3, camera), width, height, spatial_px, temporal_ms
+                    _event_group(v3, camera),
+                    width,
+                    height,
+                    spatial_px,
+                    temporal_ms,
+                    v3_time_origin_s,
+                    duration_s,
                 )
                 common = int(np.intersect1d(a, b, assume_unique=True).size)
                 precision = _safe_ratio(common, b.size)
@@ -368,7 +447,7 @@ def build_markdown(metrics: dict) -> str:
     lines = [
         "# EVIS v2 vs v3 source-level evaluation",
         "",
-        "These are seed-2, no-downstream-task metrics. Event-F1, timestamp MAE, and",
+        "These are episode-level, no-downstream-task metrics. Event-F1, timestamp MAE, and",
         "log-intensity RMSE versus truth remain unavailable until a high-rate rendered oracle exists.",
         "Segmentation/state equality makes the present comparison controlled.",
         "",
@@ -376,6 +455,10 @@ def build_markdown(metrics: dict) -> str:
         "",
         f"- State/action arrays exact: `{metrics['episode_consistency']['state_arrays_exact']}`",
         f"- Segmentation exact: `{metrics['episode_consistency']['segmentation_exact']}`",
+        f"- v2 event time origin: `{metrics['time_alignment']['v2_origin_s']:.6f} s` "
+        f"(`{metrics['time_alignment']['v2_origin_source']}`)",
+        f"- v3 event time origin: `{metrics['time_alignment']['v3_origin_s']:.6f} s` "
+        f"(`{metrics['time_alignment']['v3_origin_source']}`)",
         "",
         "## Event and temporal metrics",
         "",
@@ -462,6 +545,24 @@ def main():
     parser.add_argument("--v3-episode", required=True)
     parser.add_argument("--frame-dt", type=float, default=0.04)
     parser.add_argument("--keyframe-hz", type=float, default=25.0)
+    parser.add_argument(
+        "--event-time-origin-s",
+        type=float,
+        default=None,
+        help="Shared absolute simulation timestamp corresponding to episode t=0.",
+    )
+    parser.add_argument(
+        "--v2-time-origin-s",
+        type=float,
+        default=None,
+        help="Override the shared event time origin for v2.",
+    )
+    parser.add_argument(
+        "--v3-time-origin-s",
+        type=float,
+        default=None,
+        help="Override the shared event time origin for v3.",
+    )
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--out-md", required=True)
     args = parser.parse_args()
@@ -473,18 +574,44 @@ def main():
     ]
     consistency = episode_consistency(args.v2_episode, args.v3_episode, cameras)
     duration = consistency["n_frames"] * args.frame_dt
+    v2_origin_arg = (
+        args.v2_time_origin_s
+        if args.v2_time_origin_s is not None
+        else args.event_time_origin_s
+    )
+    v3_origin_arg = (
+        args.v3_time_origin_s
+        if args.v3_time_origin_s is not None
+        else args.event_time_origin_s
+    )
+    v2_origin_s, v2_origin_source = _resolve_time_origin(args.v2_events, v2_origin_arg)
+    v3_origin_s, v3_origin_source = _resolve_time_origin(args.v3_events, v3_origin_arg)
     metrics = {
-        "schema_version": 1,
+        "schema_version": 2,
         "cameras": cameras,
         "frame_dt_s": args.frame_dt,
         "keyframe_hz": args.keyframe_hz,
         "episode_duration_s": duration,
+        "time_alignment": {
+            "v2_origin_s": v2_origin_s,
+            "v3_origin_s": v3_origin_s,
+            "v2_origin_source": v2_origin_source,
+            "v3_origin_source": v3_origin_source,
+        },
         "episode_consistency": consistency,
-        "v2": summarize_events(args.v2_events, cameras, duration, args.keyframe_hz),
-        "v3": summarize_events(args.v3_events, cameras, duration, args.keyframe_hz),
+        "v2": summarize_events(
+            args.v2_events, cameras, duration, args.keyframe_hz, v2_origin_s
+        ),
+        "v3": summarize_events(
+            args.v3_events, cameras, duration, args.keyframe_hz, v3_origin_s
+        ),
         "roi_proxies": {
-            "v2": roi_proxy_metrics(args.v2_events, args.v2_episode, cameras, args.frame_dt),
-            "v3": roi_proxy_metrics(args.v3_events, args.v3_episode, cameras, args.frame_dt),
+            "v2": roi_proxy_metrics(
+                args.v2_events, args.v2_episode, cameras, args.frame_dt, v2_origin_s
+            ),
+            "v3": roi_proxy_metrics(
+                args.v3_events, args.v3_episode, cameras, args.frame_dt, v3_origin_s
+            ),
         },
         "voxel_agreement": voxel_agreement(
             args.v2_events,
@@ -492,6 +619,9 @@ def main():
             cameras,
             consistency["width"],
             consistency["height"],
+            v2_origin_s,
+            v3_origin_s,
+            duration,
         ),
         "unavailable_without_high_rate_oracle": [
             "event_precision_recall_f1",
@@ -501,10 +631,11 @@ def main():
         ],
     }
 
+    metrics = _json_safe(metrics)
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out_md).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out_json, "w", encoding="utf-8") as stream:
-        json.dump(metrics, stream, indent=2, ensure_ascii=False)
+        json.dump(metrics, stream, indent=2, ensure_ascii=False, allow_nan=False)
     with open(args.out_md, "w", encoding="utf-8") as stream:
         stream.write(build_markdown(metrics))
     print(f"[evaluate_evis_versions] JSON -> {args.out_json}")

@@ -177,9 +177,10 @@ def test_recorder_writes_per_event_timestamps(tmp_path):
         torch.tensor([1, 1, -1], dtype=torch.int8),
         torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64),
     )
-    recorder.flush_episode(0, 7)
+    recorder.flush_episode(0, 7, time_origin_s=0.07)
 
     with h5py.File(tmp_path / "env0_ep7.h5", "r") as stream:
+        assert stream.attrs["event_time_origin_s"] == 0.07
         np.testing.assert_allclose(stream["DVS/cam/t"][:], [0.1, 0.2, 0.3])
         np.testing.assert_allclose(stream["DVS/cam/q"][:], [1.0, 1.0, 1.0])
 
