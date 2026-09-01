@@ -81,6 +81,20 @@ def _resolve_time_origin(path: str, cli_value: float | None):
     return 0.0, "default_zero"
 
 
+def _event_source_metadata(path: str):
+    with h5py.File(path, "r") as stream:
+        metadata = {}
+        for key, value in stream.attrs.items():
+            if not str(key).startswith("evis_"):
+                continue
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            elif isinstance(value, np.generic):
+                value = value.item()
+            metadata[str(key)] = value
+    return metadata
+
+
 def _harmonic_metrics(times: np.ndarray, duration: float, keyframe_hz: float):
     """Return keyframe-line power from a 1 ms event-count signal.
 
@@ -459,6 +473,10 @@ def build_markdown(metrics: dict) -> str:
         f"(`{metrics['time_alignment']['v2_origin_source']}`)",
         f"- v3 event time origin: `{metrics['time_alignment']['v3_origin_s']:.6f} s` "
         f"(`{metrics['time_alignment']['v3_origin_source']}`)",
+        f"- v2 recorded EVIS mode: "
+        f"`{metrics['source_metadata']['v2'].get('evis_mode', 'unrecorded')}`",
+        f"- v3 recorded EVIS mode: "
+        f"`{metrics['source_metadata']['v3'].get('evis_mode', 'unrecorded')}`",
         "",
         "## Event and temporal metrics",
         "",
@@ -597,6 +615,10 @@ def main():
             "v3_origin_s": v3_origin_s,
             "v2_origin_source": v2_origin_source,
             "v3_origin_source": v3_origin_source,
+        },
+        "source_metadata": {
+            "v2": _event_source_metadata(args.v2_events),
+            "v3": _event_source_metadata(args.v3_events),
         },
         "episode_consistency": consistency,
         "v2": summarize_events(

@@ -200,7 +200,8 @@ class DVSCamera:
                  enable_warp=True, composite="log_blend", depth_key=DEPTH_ANNOTATOR,
                  margin=(0, 0, 0, 0), event_source="ldr", blur_cfgs=None, hole_fill=None,
                  mv_dilate=1, adaptive_warp=False, max_warp_factor=2,
-                 target_motion_px=1.0, target_log_step=None):
+                 target_motion_px=1.0, target_log_step=None,
+                 hybrid_gate_gain=0.0, hybrid_support_radius=2):
         self.scene = scene
         self.names = list(names)
         self.recorder = recorder
@@ -235,6 +236,8 @@ class DVSCamera:
         self.max_warp_factor = max(1, int(max_warp_factor))
         self.target_motion_px = float(target_motion_px)
         self.target_log_step = target_log_step
+        self.hybrid_gate_gain = max(0.0, float(hybrid_gate_gain))
+        self.hybrid_support_radius = max(0, int(hybrid_support_radius))
         # last timestamp seen by process() — used to infer the frame interval that
         # the motion-blur accumulator needs on the no-warp path.
         self._proc_prev_t = None
@@ -246,7 +249,8 @@ class DVSCamera:
                    group_prefix="DVS", margin=(0, 0, 0, 0), compression="gzip",
                    event_source=None, hole_fill=None, mv_dilate=1, antialiasing="Off",
                    adaptive_warp=False, max_warp_factor=2, target_motion_px=1.0,
-                   target_log_step=None):
+                   target_log_step=None, hybrid_gate_gain=0.0,
+                   hybrid_support_radius=2):
         """Build a recorder + one processor per camera and wrap ``scene``'s cameras.
 
         ``names`` are the camera keys in the scene (``scene[name]``); the events
@@ -288,6 +292,13 @@ class DVSCamera:
             print(f"\033[32m[DVSCamera] event_source=hdr (linear HDR)\033[0m", flush=True)  # green
         else:
             print(f"[DVSCamera] event_source=ldr (tone-mapped LDR)", flush=True)
+        if float(hybrid_gate_gain) > 0.0:
+            print(
+                f"\033[35m[DVSCamera] v4 hybrid gate ON "
+                f"(gain={float(hybrid_gate_gain):.2f}, "
+                f"support={int(hybrid_support_radius)}px)\033[0m",
+                flush=True,
+            )
         recorder = GeneralDVSRecorder(out_dir, compression=compression)
         # config-driven sensor noise: EACH camera reads its OWN DVSNoiseCfg (None = clean),
         # so different cameras can have different noise (or one noisy, one clean). Seed is
@@ -300,7 +311,14 @@ class DVSCamera:
             if nm is not None:
                 print(f"\033[33m[DVSCamera] {n}: sensor noise ON "
                       f"(mismatch + background/leak/shot + hot + refractory)\033[0m", flush=True)
-            procs.append(BatchedMultiCamProcessor(recorder, f"{group_prefix}/{n}", thr[n], noise=nm))
+            procs.append(BatchedMultiCamProcessor(
+                recorder,
+                f"{group_prefix}/{n}",
+                thr[n],
+                noise=nm,
+                hybrid_gate_gain=hybrid_gate_gain,
+                hybrid_support_radius=hybrid_support_radius,
+            ))
         # config-driven motion blur: EACH camera reads its OWN MotionBlurCfg (None = off).
         blur_cfgs = {}
         for n in names:
@@ -320,7 +338,9 @@ class DVSCamera:
                    event_source=event_source, blur_cfgs=blur_cfgs, hole_fill=hole_fill,
                    mv_dilate=mv_dilate, adaptive_warp=adaptive_warp,
                    max_warp_factor=max_warp_factor, target_motion_px=target_motion_px,
-                   target_log_step=target_log_step)
+                   target_log_step=target_log_step,
+                   hybrid_gate_gain=hybrid_gate_gain,
+                   hybrid_support_radius=hybrid_support_radius)
 
     def _crop(self, x):
         return crop_margin(x, self.margin)
@@ -544,5 +564,27 @@ class DVSCamera:
             proc.reset_envs(env_ids)
 
     def flush(self, env_id: int, episode_idx: int, time_origin_s=None):
-        """Write one event episode, including its optional Isaac time origin."""
-        self.recorder.flush_episode(env_id, episode_idx, time_origin_s=time_origin_s)
+        """Write one event episode with time alignment and algorithm metadata."""
+        if self.hybrid_gate_gain > 0.0:
+            mode = "v4_hybrid"
+        elif self.adaptive_warp:
+            mode = "v3_adaptive"
+        else:
+            mode = "v2_balanced"
+        metadata = {
+            "evis_schema_version": 1,
+            "evis_mode": mode,
+            "evis_event_source": self.event_source,
+            "evis_composite": self.composite,
+            "evis_adaptive_warp": self.adaptive_warp,
+            "evis_max_warp_factor": self.max_warp_factor,
+            "evis_hybrid_gate_gain": self.hybrid_gate_gain,
+            "evis_hybrid_support_radius": self.hybrid_support_radius,
+            "evis_mv_dilate": self.mv_dilate,
+        }
+        self.recorder.flush_episode(
+            env_id,
+            episode_idx,
+            time_origin_s=time_origin_s,
+            metadata=metadata,
+        )

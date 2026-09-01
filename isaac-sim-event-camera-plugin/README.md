@@ -67,6 +67,28 @@ passes the episode's initial Isaac simulation time to `DVSCamera.flush()`, so
 the explicit evaluator argument is only needed for older files. See the
 [aligned 10-episode report](report/ten_episode_v2_v3_aligned_metrics.md).
 
+### Experimental v4 hybrid gate
+
+The v4 path keeps v3 adaptive/continuous timing but rejects a weak crossing
+when it appears only in a low-confidence synthetic warp sample. Strong
+same-polarity events support their neighbours within two pixels, so moving
+object edges survive; rejected crossings still advance the photoreceptor
+reference and cannot return as a keyframe burst. The gate is opt-in and does
+not affect the balanced v2 default or real rendered samples:
+
+```python
+dvs = DVSCamera.from_scene(
+    scene,
+    camera_names,
+    adaptive_warp=True,
+    hybrid_gate_gain=0.25,
+    hybrid_support_radius=2,
+)
+```
+
+See the [seed-2 v4 pilot](report/seed2_v4_hybrid_pilot.md). It justifies a
+multi-seed evaluation, not promotion to the default.
+
 ## 🚀 Quickstart
 
 > `python` means the Isaac Sim Python. If you don't use a virtual python environment, replace `python` with `${ISAACLAB}/isaaclab.sh -p` in every command below.
