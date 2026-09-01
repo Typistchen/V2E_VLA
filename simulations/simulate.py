@@ -912,8 +912,15 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
             camera_names,
             out_dir=sim_cfg["event_output_dir"],
             enable_warp=sim_cfg["event_warp"] > 1,
-            adaptive_warp=sim_cfg["event_adaptive_warp"],
+            adaptive_warp=(
+                sim_cfg["event_adaptive_warp"] or sim_cfg["event_hybrid"]
+            ),
             max_warp_factor=sim_cfg["event_max_warp_factor"],
+            hybrid_gate_gain=(
+                sim_cfg["event_hybrid_gate_gain"]
+                if sim_cfg["event_hybrid"] else 0.0
+            ),
+            hybrid_support_radius=sim_cfg["event_hybrid_support_radius"],
         )
         if sim_cfg["event_warp"] > 1:
             dvs_prev = dvs.snapshot()
@@ -1280,6 +1287,9 @@ def main(args):
             "event_warp": args.event_warp,
             "event_adaptive_warp": args.event_adaptive_warp,
             "event_max_warp_factor": args.event_max_warp_factor,
+            "event_hybrid": args.event_hybrid,
+            "event_hybrid_gate_gain": args.event_hybrid_gate_gain,
+            "event_hybrid_support_radius": args.event_hybrid_support_radius,
             "num_envs": args.num_envs,
             "path_tracing": args.path_tracing,
         }
@@ -1452,6 +1462,30 @@ if __name__ == "__main__":
         default=2,
         help="Maximum adaptive knots as a multiple of --event_warp (default: 2).",
     )
+    parser.add_argument(
+        "--event_hybrid",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Opt into v4: v3 adaptive/continuous timing plus confidence-gated "
+            "weak synthetic events; v2 remains the default."
+        ),
+    )
+    parser.add_argument(
+        "--event_hybrid_gate_gain",
+        type=float,
+        default=0.25,
+        help=(
+            "Extra weak-event gate at low warp confidence; q=0.5 requires "
+            "1.125x contrast when gain=0.25 (default: 0.25)."
+        ),
+    )
+    parser.add_argument(
+        "--event_hybrid_support_radius",
+        type=int,
+        default=2,
+        help="Same-polarity strong-edge support radius in pixels (default: 2).",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("-n", "--n_simulations", type=int, default=10_000)
     args = parser.parse_args(script_args)
@@ -1463,6 +1497,10 @@ if __name__ == "__main__":
         parser.error("--event_warp must be at least 1")
     if args.event_max_warp_factor < 1:
         parser.error("--event_max_warp_factor must be at least 1")
+    if args.event_hybrid_gate_gain < 0:
+        parser.error("--event_hybrid_gate_gain must be non-negative")
+    if args.event_hybrid_support_radius < 0:
+        parser.error("--event_hybrid_support_radius must be non-negative")
     # Copy the shared parameters from isaaclab_args to args
     for sp in SHARED_PARAMETERS:
         if sp in isaaclab_args:
