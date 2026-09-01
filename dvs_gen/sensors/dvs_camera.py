@@ -543,6 +543,6 @@ class DVSCamera:
         for proc in self.procs:
             proc.reset_envs(env_ids)
 
-    def flush(self, env_id: int, episode_idx: int):
-        """Write the buffered events for one (env, episode) to HDF5."""
-        self.recorder.flush_episode(env_id, episode_idx)
+    def flush(self, env_id: int, episode_idx: int, time_origin_s=None):
+        """Write one event episode, including its optional Isaac time origin."""
+        self.recorder.flush_episode(env_id, episode_idx, time_origin_s=time_origin_s)

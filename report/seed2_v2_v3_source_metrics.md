@@ -1,5 +1,11 @@
 # Seed-2 EVIS v2/v3 source-level metrics
 
+> **Historical, superseded report:** this report was generated before event
+> timestamps were shifted from absolute Isaac time to episode-relative time.
+> Its boundary/halo/static ROI values are misaligned by approximately 70 ms and
+> must not be used as final evidence. See
+> [the corrected 10-episode report](ten_episode_v2_v3_aligned_metrics.md).
+
 This report compares balanced v2 (fixed `K=4`) and experimental v3
 (`K=4..8`, per-event confidence) on the same DOM cup episode. It does not use a
 VLA downstream task.

@@ -9,6 +9,7 @@ be imported and unit-tested outside Isaac Sim.
 
 HDF5 layout (one file ``env{env_id}_ep{episode_idx}.h5`` per environment)::
 
+    @event_time_origin_s  float64  absolute Isaac time corresponding to episode t=0
     /<camera_name>/x   uint16   (gzip)  pixel x
     /<camera_name>/y   uint16   (gzip)  pixel y
     /<camera_name>/t   float64  (gzip)  timestamp (seconds)
@@ -93,8 +94,14 @@ class GeneralDVSRecorder:
                     self._events[int(e)][camera_name].append(
                         (x_np[m], y_np[m], t_np[m], p_np[m], q_np[m]))
 
-    def flush_episode(self, env_id: int, episode_idx: int):
-        """Flushes all cameras for a single environment to a single HDF5 file."""
+    def flush_episode(self, env_id: int, episode_idx: int, time_origin_s=None):
+        """Flush all cameras for one environment to an HDF5 event file.
+
+        ``time_origin_s`` is the absolute Isaac simulation time of the episode's
+        first source frame. Event timestamps remain losslessly absolute; the
+        metadata lets evaluators and dataset readers convert them to relative
+        episode time without guessing from the first threshold crossing.
+        """
         with self._lock:
             if env_id not in self._events or not self._events[env_id]:
                 return
@@ -106,6 +113,8 @@ class GeneralDVSRecorder:
 
         counts = {}
         with h5py.File(filename, "w") as f:
+            if time_origin_s is not None:
+                f.attrs["event_time_origin_s"] = float(time_origin_s)
             for cam_name, chunks in env_data.items():
                 if not chunks: continue
 
