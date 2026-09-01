@@ -11,6 +11,7 @@ the reference advances by exact threshold increments, preserving the residual.
 Pure torch — no Omniverse dependency.
 """
 import torch
+import torch.nn.functional as F
 
 from .recorder import GeneralDVSRecorder
 
@@ -18,12 +19,20 @@ from .recorder import GeneralDVSRecorder
 class BatchedMultiCamProcessor:
     """Processes batched RGB tensors for ONE specific camera across ALL envs."""
     def __init__(self, recorder: GeneralDVSRecorder, camera_name: str, threshold: float = 0.15,
-                 noise=None):
+                 noise=None, hybrid_gate_gain: float = 0.0,
+                 hybrid_support_radius: int = 2):
         self.recorder = recorder
         self.camera_name = camera_name
         self.threshold = threshold
         # optional DVSNoiseModel (dvs_gen.dvs.noise). None = the ideal clean model.
         self.noise = noise
+        # v4 opt-in: a low-confidence synthetic warp sample must exceed a
+        # slightly stronger contrast gate before its already-quantized sensor
+        # crossings are recorded. Rejected weak crossings are consumed from the
+        # reference, so they cannot reappear as a keyframe burst. Strong events
+        # and same-polarity neighbours remain intact to preserve object edges.
+        self.hybrid_gate_gain = max(0.0, float(hybrid_gate_gain))
+        self.hybrid_support_radius = max(0, int(hybrid_support_radius))
         self.ref_log_intensity = None
         self.prev_log_intensity = None
         self.prev_time = None
@@ -152,6 +161,27 @@ class BatchedMultiCamProcessor:
             n_pos[reset_mask] = 0
             n_neg[reset_mask] = 0
 
+        # Hybrid v4 keeps the physical threshold grid and reference update from
+        # v2/v3, but declines weak crossings that exist only in an uncertain
+        # synthetic sample. Using the CURRENT sample confidence means a real
+        # keyframe (q=1) is never gated because the preceding warp was uncertain.
+        emit_pos, emit_neg = n_pos, n_neg
+        if self.hybrid_gate_gain > 0.0:
+            gate_scale = 1.0 + self.hybrid_gate_gain * (1.0 - confidence)
+            strong_pos = diff >= th_on_full * gate_scale
+            strong_neg = -diff >= th_off_full * gate_scale
+            if self.hybrid_support_radius > 0:
+                radius = self.hybrid_support_radius
+                kernel = 2 * radius + 1
+                strong_pos = F.max_pool2d(
+                    strong_pos.float().unsqueeze(1), kernel, stride=1, padding=radius
+                ).squeeze(1) > 0
+                strong_neg = F.max_pool2d(
+                    strong_neg.float().unsqueeze(1), kernel, stride=1, padding=radius
+                ).squeeze(1) > 0
+            emit_pos = torch.where(strong_pos, n_pos, torch.zeros_like(n_pos))
+            emit_neg = torch.where(strong_neg, n_neg, torch.zeros_like(n_neg))
+
         # Advance by exact threshold increments. The sub-threshold remainder is
         # retained in (log_intensity - reference) for the next frame.
         ref_before = self.ref_log_intensity.clone()
@@ -166,7 +196,7 @@ class BatchedMultiCamProcessor:
         # chronological for each pixel.
         if self.noise is not None:
             pos_seen, neg_seen = self._record_crossing_layers(
-                n_pos, n_neg, th_on_full, th_off_full, ref_before,
+                emit_pos, emit_neg, th_on_full, th_off_full, ref_before,
                 log_intensity, current_time, event_confidence,
             )
             empty = torch.zeros_like(n_pos, dtype=torch.bool)
@@ -178,7 +208,7 @@ class BatchedMultiCamProcessor:
             neg_seen |= noise_neg
         else:
             pos_seen, neg_seen = self._record_expanded_crossings(
-                n_pos, n_neg, th_on_full, th_off_full, ref_before,
+                emit_pos, emit_neg, th_on_full, th_off_full, ref_before,
                 log_intensity, current_time, event_confidence,
             )
 

@@ -167,6 +167,59 @@ def test_invalid_warp_pixel_is_suppressed_and_reanchored_on_recovery():
     assert recorder.events()["p"].tolist() == [1]
 
 
+def test_hybrid_gate_consumes_weak_uncertain_crossing_without_replay():
+    recorder = MemoryRecorder()
+    processor = BatchedMultiCamProcessor(
+        recorder, "cam", threshold=0.15,
+        hybrid_gate_gain=1.0, hybrid_support_radius=0,
+    )
+    processor(rgb_from_log(0.0), 0.0)
+    processor(rgb_from_log(0.16), 1.0, confidence=torch.tensor([[[0.5]]]))
+
+    assert recorder.events()["p"].numel() == 0
+    assert torch.allclose(
+        processor.ref_log_intensity,
+        torch.full_like(processor.ref_log_intensity, 0.15),
+        atol=1e-5,
+    )
+
+    # The rejected crossing advanced the reference and cannot return as a burst.
+    processor(rgb_from_log(0.16), 2.0)
+    assert recorder.events()["p"].numel() == 0
+
+
+def test_hybrid_gate_keeps_strong_uncertain_crossings_and_edge_support():
+    recorder = MemoryRecorder()
+    processor = BatchedMultiCamProcessor(
+        recorder, "cam", threshold=0.15,
+        hybrid_gate_gain=1.0, hybrid_support_radius=1,
+    )
+    processor(rgb_pixels_from_logs([0.0, 0.0]), 0.0)
+    processor(
+        rgb_pixels_from_logs([0.31, 0.16]),
+        1.0,
+        confidence=torch.full((1, 1, 2), 0.5),
+    )
+
+    # The strong first pixel emits two events; its same-polarity 1-px support
+    # keeps the weak anti-aliased neighbour's one event.
+    events = recorder.events()
+    assert events["p"].tolist() == [1, 1, 1]
+    assert sorted(events["x"].tolist()) == [0, 0, 1]
+
+
+def test_hybrid_gate_always_trusts_a_real_current_keyframe():
+    recorder = MemoryRecorder()
+    processor = BatchedMultiCamProcessor(
+        recorder, "cam", threshold=0.15,
+        hybrid_gate_gain=1.0, hybrid_support_radius=0,
+    )
+    processor(rgb_from_log(0.0), 0.0, confidence=torch.tensor([[[0.5]]]))
+    processor(rgb_from_log(0.16), 1.0)  # current q=1: real frame
+
+    assert recorder.events()["p"].tolist() == [1]
+
+
 def test_recorder_writes_per_event_timestamps(tmp_path):
     recorder = GeneralDVSRecorder(str(tmp_path), compression=None)
     recorder.record(
@@ -177,10 +230,13 @@ def test_recorder_writes_per_event_timestamps(tmp_path):
         torch.tensor([1, 1, -1], dtype=torch.int8),
         torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64),
     )
-    recorder.flush_episode(0, 7, time_origin_s=0.07)
+    recorder.flush_episode(
+        0, 7, time_origin_s=0.07, metadata={"evis_mode": "test_mode"}
+    )
 
     with h5py.File(tmp_path / "env0_ep7.h5", "r") as stream:
         assert stream.attrs["event_time_origin_s"] == 0.07
+        assert stream.attrs["evis_mode"] == "test_mode"
         np.testing.assert_allclose(stream["DVS/cam/t"][:], [0.1, 0.2, 0.3])
         np.testing.assert_allclose(stream["DVS/cam/q"][:], [1.0, 1.0, 1.0])
 
