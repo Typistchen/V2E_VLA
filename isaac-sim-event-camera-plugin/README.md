@@ -89,6 +89,27 @@ dvs = DVSCamera.from_scene(
 See the [seed-2 v4 pilot](report/seed2_v4_hybrid_pilot.md). It justifies a
 multi-seed evaluation, not promotion to the default.
 
+### Ego-compensated dynamic events (ECDM)
+
+DynamicVLA's optional `--event_dynamic_gt` capture records wrist metric depth,
+Isaac motion vectors, the current ROS-optical camera pose, and intrinsics. The
+offline extractor predicts static-world flow from depth and camera motion,
+subtracts it from observed motion, applies depth-edge validity and temporal
+target memory, and writes event-level `q_dyn` / `q_target_dyn` confidence:
+
+```bash
+python scripts/extract_ego_dynamic_events.py \
+  --episode /path/to/episode.h5 \
+  --events /path/to/events/env0_ep2.h5 \
+  --camera wrist_cam --out-dir /tmp/ecdm_demo2 \
+  --static-quantile 0.95
+```
+
+Outputs include a derived event HDF5, metrics JSON, Raw/Dynamic/Target event
+comparison video, six-panel geometry diagnostic, and standalone dynamic-event
+videos. Simulator semantic labels are used for calibration/evaluation and the
+target-conditioned stream; `q_dyn` itself comes from motion residual.
+
 ## 🚀 Quickstart
 
 > `python` means the Isaac Sim Python. If you don't use a virtual python environment, replace `python` with `${ISAACLAB}/isaaclab.sh -p` in every command below.

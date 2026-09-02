@@ -234,17 +234,21 @@ def _set_up_scene_cameras(scene_cfg, sim_cfg, robot):
     import configs.scene_cfg
 
     # Set up the wrist camera on the robot arm
+    wrist_camera_cfg = configs.scene_cfg.get_camera_cfg(
+        sim_cfg["camera"].copy(),
+        configs.robot_cfg.get_wrist_camera_cfg(robot),
+        event_camera=sim_cfg["event_camera"],
+        event_threshold=sim_cfg["event_threshold"],
+        event_source=sim_cfg["event_source"],
+        event_warp=sim_cfg["event_warp"] > 1,
+    )
+    # CameraData poses are otherwise initialisation-only in Isaac Lab. ECDM
+    # needs the current wrist pose at every RGB/event keyframe.
+    wrist_camera_cfg.update_latest_camera_pose = sim_cfg["event_dynamic_gt"]
     scene_cfg = configs.scene_cfg.add_scene_camera(
         scene_cfg,
         "wrist_cam",
-        configs.scene_cfg.get_camera_cfg(
-            sim_cfg["camera"].copy(),
-            configs.robot_cfg.get_wrist_camera_cfg(robot),
-            event_camera=sim_cfg["event_camera"],
-            event_threshold=sim_cfg["event_threshold"],
-            event_source=sim_cfg["event_source"],
-            event_warp=sim_cfg["event_warp"] > 1,
-        ),
+        wrist_camera_cfg,
     )
     # Set up the cameras according to relative position in the config file
     for cam in sim_cfg["scene"]["cameras"]:
@@ -752,11 +756,12 @@ def _get_robot_relative_quaternion(w_quat, robot_quat):
     return quat_mul(quat_inv(robot_quat), w_quat)
 
 
-def get_camera_views(sensors, views=["rgb"]):
+def get_camera_views(sensors, views=["rgb"], geometry_cameras=()):
     # NOTE: import isaaclab.utils does not work
     from isaaclab.utils import convert_dict_to_backend
 
     cam_views = {}
+    geometry_cameras = set(geometry_cameras)
     for name, sensor in sensors.items():
         if type(sensor).__name__ == "Camera":
             cam_views[name] = convert_dict_to_backend(
@@ -775,6 +780,45 @@ def get_camera_views(sensors, views=["rgb"]):
                 del cam_views[name]["semantic_segmentation"]
 
             cam_views[name] = {k: v for k, v in cam_views[name].items() if k in views}
+
+            # ECDM geometry capture.  Keep these tensors out of normal episodes:
+            # dense metric depth and motion vectors add substantial storage.
+            # The ROS optical convention is saved because its +Z-forward,
+            # +X-right, +Y-down axes match the pinhole projection used by the
+            # offline ego-flow extractor.
+            if name in geometry_cameras:
+                output = sensor.data.output
+                if "distance_to_image_plane" not in output:
+                    raise RuntimeError(
+                        f"{name} is missing distance_to_image_plane required by ECDM"
+                    )
+                if "motion_vectors" not in output:
+                    raise RuntimeError(
+                        f"{name} is missing motion_vectors required by ECDM"
+                    )
+                cam_views[name]["depth_metric"] = (
+                    output["distance_to_image_plane"]
+                    .detach()
+                    .to(dtype=torch.float16)
+                    .cpu()
+                    .numpy()
+                )
+                cam_views[name]["motion_vectors"] = (
+                    output["motion_vectors"][..., :2]
+                    .detach()
+                    .to(dtype=torch.float16)
+                    .cpu()
+                    .numpy()
+                )
+                pose_w_ros = torch.cat(
+                    [sensor.data.pos_w, sensor.data.quat_w_ros], dim=-1
+                )
+                cam_views[name]["pose_w_ros"] = (
+                    pose_w_ros.detach().float().cpu().numpy()
+                )
+                cam_views[name]["intrinsics"] = (
+                    sensor.data.intrinsic_matrices.detach().float().cpu().numpy()
+                )
 
     return cam_views
 
@@ -1017,7 +1061,11 @@ def simulate(sim_cfg, task, robot, scene_dir, object_metadata, seed):
         next_state = state_machine.compute(curr_state)
 
         cam_views = get_camera_views(
-            env.unwrapped.scene.sensors, ["rgb", "depth", "seg"]
+            env.unwrapped.scene.sensors,
+            ["rgb", "depth", "seg"],
+            geometry_cameras=(
+                ["wrist_cam"] if sim_cfg["event_dynamic_gt"] else []
+            ),
         )
         env.step(next_state["action"])
         if dvs is not None:
@@ -1154,6 +1202,15 @@ def get_frames(
 
         cam_name = st_key[:cam_idx]
         img_name = st_key[cam_idx + 5 :]
+        if img_name not in {
+            "rgb",
+            "depth",
+            "distance_to_image_plane",
+            "distance_to_camera",
+            "seg",
+            "semantic_segmentation",
+        }:
+            continue
         if cam_name not in cam_frames:
             cam_frames[cam_name] = {}
         if img_name not in cam_frames[cam_name]:
@@ -1290,6 +1347,7 @@ def main(args):
             "event_hybrid": args.event_hybrid,
             "event_hybrid_gate_gain": args.event_hybrid_gate_gain,
             "event_hybrid_support_radius": args.event_hybrid_support_radius,
+            "event_dynamic_gt": args.event_dynamic_gt,
             "num_envs": args.num_envs,
             "path_tracing": args.path_tracing,
         }
@@ -1486,6 +1544,15 @@ if __name__ == "__main__":
         default=2,
         help="Same-polarity strong-edge support radius in pixels (default: 2).",
     )
+    parser.add_argument(
+        "--event_dynamic_gt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Save wrist metric depth, motion vectors, ROS camera pose, and "
+            "intrinsics for ego-compensated dynamic-event extraction."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("-n", "--n_simulations", type=int, default=10_000)
     args = parser.parse_args(script_args)
@@ -1501,6 +1568,8 @@ if __name__ == "__main__":
         parser.error("--event_hybrid_gate_gain must be non-negative")
     if args.event_hybrid_support_radius < 0:
         parser.error("--event_hybrid_support_radius must be non-negative")
+    if args.event_dynamic_gt and not args.event_camera:
+        parser.error("--event_dynamic_gt requires --event_camera")
     # Copy the shared parameters from isaaclab_args to args
     for sp in SHARED_PARAMETERS:
         if sp in isaaclab_args:
