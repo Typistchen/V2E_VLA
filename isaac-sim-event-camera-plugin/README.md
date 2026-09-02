@@ -110,6 +110,30 @@ comparison video, six-panel geometry diagnostic, and standalone dynamic-event
 videos. Simulator semantic labels are used for calibration/evaluation and the
 target-conditioned stream; `q_dyn` itself comes from motion residual.
 
+### Lighting-suppressed motion separation
+
+`scripts/separate_dynamic_static_events.py` is the semantic-free successor to
+the ECDM target-mask pilot. It separates wrist events into soft
+`q_static`, `q_dynamic`, `q_illumination`, and `q_unknown` channels.
+Depth consistency, chromaticity, temporal support, and exposure-compensated
+log-intensity residuals suppress brightness-only changes. Segmentation and
+object velocity are held out from the algorithm and used only for evaluation:
+
+```bash
+python scripts/separate_dynamic_static_events.py \
+  --episode /path/to/episode.h5 \
+  --events /path/to/events/env0_ep2.h5 \
+  --camera wrist_cam --out-dir /tmp/motion-separation
+```
+
+The current simulator pilot uses Isaac motion vectors as an observed-flow upper
+bound. A deployable version must replace that input with estimated RGB/event
+flow or RGB-D scene flow.
+
+The v2 classifier combines absolute residual motion with residual normalized by
+ego-flow magnitude, preventing thresholds from drifting with wrist speed. See
+the [controlled ten-demo report](report/ten_demo_motion_separation_v2.md).
+
 ## 🚀 Quickstart
 
 > `python` means the Isaac Sim Python. If you don't use a virtual python environment, replace `python` with `${ISAACLAB}/isaaclab.sh -p` in every command below.
